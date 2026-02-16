@@ -28,6 +28,10 @@ function do_cmake_build() {
 
 function clean_third_party {
   local library_name="$1"
+  if [[ -z "${CONDA_PREFIX}" ]]; then
+    echo "CONDA_PREFIX is empty; skip clean_third_party for ${library_name}"
+    return
+  fi
   if [ "$CLEAN_THIRD_PARTY" == 1 ]; then
     rm -rf "${CONDA_PREFIX}"/include/"${library_name}"*/
     rm -rf "${CONDA_PREFIX}"/include/"${library_name}"*.h
@@ -160,7 +164,7 @@ function build_third_party {
     build_fb_oss_library "https://github.com/google/double-conversion.git" "v3.3.1" double-conversion
     build_fb_oss_library "https://github.com/facebook/folly.git" "$third_party_tag" folly "-DUSE_STATIC_DEPS_ON_UNIX=ON -DOPENSSL_USE_STATIC_LIBS=ON"
   else
-    if [[ -z "${NCCL_SKIP_CONDA_INSTALL}" ]]; then
+    if [[ "${NCCL_USE_CONDA}" == 1 && -z "${NCCL_SKIP_CONDA_INSTALL}" ]]; then
       DEPS=(
         cmake
         ninja
@@ -184,6 +188,8 @@ function build_third_party {
         fmt
       )
       conda install "${DEPS[@]}" --yes
+    else
+      echo "USE_SYSTEM_LIBS=1 and NCCL_USE_CONDA!=1; skipping conda install"
     fi
   fi
 
@@ -248,9 +254,30 @@ fi
 NCCL_FP8=${NCCL_FP8:=1}
 CLEAN_BUILD=${CLEAN_BUILD:=0}
 INCREMENTAL_BUILD=${INCREMENTAL_BUILD:=1}
-LIB_SUFFIX=${LIB_SUFFIX:-lib}
-CONDA_INCLUDE_DIR="${CONDA_PREFIX}/include"
-CONDA_LIB_DIR="${CONDA_PREFIX}/lib"
+
+# Choose a writable install prefix when CONDA_PREFIX is unset.
+INSTALL_PREFIX="${INSTALL_PREFIX:-${CMAKE_PREFIX_PATH:-${CONDA_PREFIX:-}}}"
+if [[ -z "${INSTALL_PREFIX}" ]]; then
+  if [[ -n "${PSCRATCH:-}" ]]; then
+    INSTALL_PREFIX="${PSCRATCH}/ncclx-deps"
+  elif [[ -n "${SCRATCH:-}" ]]; then
+    INSTALL_PREFIX="${SCRATCH}/ncclx-deps"
+  else
+    INSTALL_PREFIX="${HOME}/.local/ncclx-deps"
+  fi
+fi
+export CONDA_PREFIX="${INSTALL_PREFIX}"
+export CMAKE_PREFIX_PATH="${INSTALL_PREFIX}"
+
+if [[ -z "${LIB_SUFFIX:-}" ]]; then
+  if [[ -d "${INSTALL_PREFIX}/lib64" ]]; then
+    LIB_SUFFIX=lib64
+  else
+    LIB_SUFFIX=lib
+  fi
+fi
+CONDA_INCLUDE_DIR="${INSTALL_PREFIX}/include"
+CONDA_LIB_DIR="${INSTALL_PREFIX}/${LIB_SUFFIX}"
 NCCL_HOOK_LIBS=${NCCL_HOOK_LIBS:=0}
 NCCL_HOME=${NCCL_HOME:="${PWD}/comms/ncclx/stable"}
 BASE_DIR=${BASE_DIR:="${PWD}"}
@@ -282,10 +309,13 @@ if [ ! -f "$CVARS_DIR/nccl_cvars.cc.in" ]; then
   exit 1
 fi
 
-# Install pyyaml if not already installed (required by extractcvars.py)
-if [[ -z "${NCCL_SKIP_CONDA_INSTALL}" ]]; then
-  conda install pyyaml --yes
-fi
+# Ensure PyYAML is available for extractcvars.py (no conda requirement).
+python3 - <<'PY'
+try:
+  import yaml  # noqa: F401
+except Exception as e:
+  raise SystemExit("PyYAML not found. Install it in your Python env (e.g., `python3 -m pip install pyyaml`).")
+PY
 
 # Run the extractcvars.py script directly to generate the files
 export NCCL_CVARS_OUTPUT_DIR="$CVARS_DIR"
