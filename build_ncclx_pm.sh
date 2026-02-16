@@ -8,14 +8,14 @@ function do_cmake_build() {
   local extra_flags="$2"
   cmake -G Ninja \
     -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
-    -DCMAKE_INSTALL_PREFIX="$CMAKE_PREFIX_PATH" \
+    -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
     -DCMAKE_MODULE_PATH="$CMAKE_PREFIX_PATH" \
-    -DCMAKE_INSTALL_DIR="$CMAKE_PREFIX_PATH" \
-    -DBIN_INSTALL_DIR="$CMAKE_PREFIX_PATH/bin" \
-    -DLIB_INSTALL_DIR="$CMAKE_PREFIX_PATH/$LIB_SUFFIX" \
-    -DINCLUDE_INSTALL_DIR="$CMAKE_PREFIX_PATH/include" \
-    -DCMAKE_INSTALL_INCLUDEDIR="$CMAKE_PREFIX_PATH/include" \
-    -DCMAKE_INSTALL_LIBDIR="$CMAKE_PREFIX_PATH/$LIB_SUFFIX" \
+    -DCMAKE_INSTALL_DIR="$INSTALL_PREFIX" \
+    -DBIN_INSTALL_DIR="$INSTALL_PREFIX/bin" \
+    -DLIB_INSTALL_DIR="$INSTALL_PREFIX/$LIB_SUFFIX" \
+    -DINCLUDE_INSTALL_DIR="$INSTALL_PREFIX/include" \
+    -DCMAKE_INSTALL_INCLUDEDIR="$INSTALL_PREFIX/include" \
+    -DCMAKE_INSTALL_LIBDIR="$INSTALL_PREFIX/$LIB_SUFFIX" \
     -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_CXX_STANDARD=20 \
@@ -85,7 +85,7 @@ function build_automake_library() {
 
   export LDFLAGS="-Wl,--allow-shlib-undefined"
   pushd "$library_name"
-  ./configure --prefix="$CMAKE_PREFIX_PATH" --disable-pie
+  ./configure --prefix="$INSTALL_PREFIX" --disable-pie
 
   make -j
   make install
@@ -107,7 +107,7 @@ function build_boost() {
 
   export LDFLAGS="-Wl,--allow-shlib-undefined"
   pushd "$library_name"
-  ./bootstrap.sh --prefix="$CMAKE_PREFIX_PATH" --libdir="$CMAKE_PREFIX_PATH/$LIB_SUFFIX" --without-libraries=python
+  ./bootstrap.sh --prefix="$INSTALL_PREFIX" --libdir="$INSTALL_PREFIX/$LIB_SUFFIX" --without-libraries=python
   ./b2 -q cxxflags=-fPIC cflags=-fPIC install
   popd
 }
@@ -126,7 +126,7 @@ function build_openssl() {
   fi
 
   pushd "$library_name"
-  ./config no-shared --prefix="$CMAKE_PREFIX_PATH" --openssldir="$CMAKE_PREFIX_PATH" --libdir=lib
+  ./config no-shared --prefix="$INSTALL_PREFIX" --openssldir="$INSTALL_PREFIX" --libdir=lib
 
   make -j
   make install
@@ -236,8 +236,6 @@ if [ -z "$DEV_SIGNATURE" ]; then
 fi
 
 set -e
-
-export CMAKE_PREFIX_PATH="$CONDA_PREFIX"
 export LIB_PREFIX="lib64"
 
 BUILDDIR=${BUILDDIR:="${PWD}/build/ncclx"}
@@ -267,7 +265,15 @@ if [[ -z "${INSTALL_PREFIX}" ]]; then
   fi
 fi
 export CONDA_PREFIX="${INSTALL_PREFIX}"
-export CMAKE_PREFIX_PATH="${INSTALL_PREFIX}"
+if [[ -z "${INSTALL_PREFIX}" || "${INSTALL_PREFIX}" == "/" ]]; then
+  echo "ERROR: INSTALL_PREFIX is empty or '/'. Set INSTALL_PREFIX or CMAKE_PREFIX_PATH to a writable path."
+  exit 1
+fi
+if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
+  export CMAKE_PREFIX_PATH="${INSTALL_PREFIX}:${CMAKE_PREFIX_PATH}"
+else
+  export CMAKE_PREFIX_PATH="${INSTALL_PREFIX}"
+fi
 
 if [[ -z "${LIB_SUFFIX:-}" ]]; then
   if [[ -d "${INSTALL_PREFIX}/lib64" ]]; then
