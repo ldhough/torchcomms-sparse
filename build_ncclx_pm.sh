@@ -3,10 +3,22 @@
 
 set -x
 
+# Perlmutter: HOME may be unset in some environments (e.g. Claude Code).
+if [[ -z "${HOME:-}" ]]; then
+  HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+  export HOME
+fi
+
 function do_cmake_build() {
   local source_dir="$1"
   local extra_flags="$2"
+  # Clear stale cmake cache so the shared build-output dir can be
+  # reconfigured for a different source tree.
+  rm -f CMakeCache.txt
+  rm -rf CMakeFiles
   cmake -G Ninja \
+    -DCMAKE_C_COMPILER="${CC_FOR_BUILD:-$(command -v gcc)}" \
+    -DCMAKE_CXX_COMPILER="${CXX_FOR_BUILD:-$(command -v g++)}" \
     -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
     -DCMAKE_MODULE_PATH="$CMAKE_PREFIX_PATH" \
@@ -22,8 +34,8 @@ function do_cmake_build() {
     -DCMAKE_POLICY_VERSION_MINIMUM=3.22 \
     $extra_flags \
     -S "${source_dir}"
-  ninja
-  ninja install
+  ninja -j4
+  ninja -j4 install
 }
 
 function clean_third_party {
@@ -160,7 +172,7 @@ function build_third_party {
     build_fb_oss_library "https://github.com/facebook/zstd.git" "v1.5.6" zstd
     build_automake_library "https://github.com/jedisct1/libsodium.git" "1.0.20-RELEASE" sodium
     build_fb_oss_library "https://github.com/fastfloat/fast_float.git" "v8.0.2" fast_float "-DFASTFLOAT_INSTALL=ON"
-    build_fb_oss_library "https://github.com/libevent/libevent.git" "release-2.1.12-stable" event
+    build_fb_oss_library "https://github.com/libevent/libevent.git" "release-2.1.12-stable" event "-DEVENT__DISABLE_TESTS=ON -DEVENT__DISABLE_BENCHMARK=ON -DEVENT__DISABLE_SAMPLES=ON"
     build_fb_oss_library "https://github.com/google/double-conversion.git" "v3.3.1" double-conversion
     build_fb_oss_library "https://github.com/facebook/folly.git" "$third_party_tag" folly "-DUSE_STATIC_DEPS_ON_UNIX=ON -DOPENSSL_USE_STATIC_LIBS=ON"
   else
@@ -217,6 +229,20 @@ function build_comms_tracing_service {
 
   # set up the build config
   cp -r /tmp/third-party/thrift/build .
+  # Generate a minimal FBThriftConfig.cmake that points at the install prefix.
+  # The installed version uses PACKAGE_PREFIX_DIR relative to its own location,
+  # which breaks when copied elsewhere.
+  cat > build/fbcode_builder/CMake/FBThriftConfig.cmake <<FBCFG
+set(FBTHRIFT_INCLUDE_DIR "${INSTALL_PREFIX}/include")
+set(FBTHRIFT_COMPILER "${INSTALL_PREFIX}/bin/thrift1")
+find_package(Xxhash REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(mvfst CONFIG REQUIRED)
+if (NOT TARGET FBThrift::thriftcpp2)
+  include("${INSTALL_PREFIX}/FBThriftTargets.cmake")
+endif()
+set(FBThrift_FOUND True)
+FBCFG
 
   # build the thrift service library
   cd build
@@ -240,7 +266,15 @@ export LIB_PREFIX="lib64"
 
 BUILDDIR=${BUILDDIR:="${PWD}/build/ncclx"}
 CUDA_HOME=${CUDA_HOME:="/usr/local/cuda"}
-NVCC_ARCH=${NVCC_ARCH:="a100,h100"}
+# Perlmutter: auto-detect CUDA_HOME from nvcc if the default doesn't exist
+if [[ ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+  _nvcc_path="$(command -v nvcc 2>/dev/null || true)"
+  if [[ -n "$_nvcc_path" ]]; then
+    CUDA_HOME="$(dirname "$(dirname "$_nvcc_path")")"
+  fi
+  unset _nvcc_path
+fi
+NVCC_ARCH=${NVCC_ARCH:="a100"}
 
 # Add b200 support if CUDA 12.8+ is available
 CUDA_VERSION=$("${CUDA_HOME}/bin/nvcc" --version | grep -oP 'release \K[0-9]+\.[0-9]+')
@@ -253,8 +287,9 @@ NCCL_FP8=${NCCL_FP8:=1}
 CLEAN_BUILD=${CLEAN_BUILD:=0}
 INCREMENTAL_BUILD=${INCREMENTAL_BUILD:=1}
 
-# Choose a writable install prefix when CONDA_PREFIX is unset.
-INSTALL_PREFIX="${INSTALL_PREFIX:-${CMAKE_PREFIX_PATH:-${CONDA_PREFIX:-}}}"
+# Choose a writable install prefix.  Use an explicit INSTALL_PREFIX or
+# CONDA_PREFIX if provided; otherwise fall back to a user-writable directory.
+INSTALL_PREFIX="${INSTALL_PREFIX:-${CONDA_PREFIX:-}}"
 if [[ -z "${INSTALL_PREFIX}" ]]; then
   if [[ -n "${PSCRATCH:-}" ]]; then
     INSTALL_PREFIX="${PSCRATCH}/ncclx-deps"
@@ -266,9 +301,19 @@ if [[ -z "${INSTALL_PREFIX}" ]]; then
 fi
 export CONDA_PREFIX="${INSTALL_PREFIX}"
 if [[ -z "${INSTALL_PREFIX}" || "${INSTALL_PREFIX}" == "/" ]]; then
-  echo "ERROR: INSTALL_PREFIX is empty or '/'. Set INSTALL_PREFIX or CMAKE_PREFIX_PATH to a writable path."
+  echo "ERROR: INSTALL_PREFIX is empty or '/'. Set INSTALL_PREFIX or CONDA_PREFIX to a writable path."
   exit 1
 fi
+mkdir -p "${INSTALL_PREFIX}"
+
+# Load cmake module if available (must happen AFTER INSTALL_PREFIX is set so
+# module-injected CMAKE_PREFIX_PATH does not leak into INSTALL_PREFIX).
+if command -v module &>/dev/null; then
+  module load cmake 2>/dev/null || true
+fi
+
+# Build CMAKE_PREFIX_PATH: our install prefix first, then anything the
+# environment (or modules) already added.
 if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
   export CMAKE_PREFIX_PATH="${INSTALL_PREFIX}:${CMAKE_PREFIX_PATH}"
 else
@@ -293,6 +338,8 @@ THIRD_PARTY_LDFLAGS=""
 if [[ -z "${NCCL_BUILD_SKIP_DEPS}" ]]; then
   echo "Building dependencies"
   build_third_party
+fi
+if [[ -z "${NCCL_BUILD_SKIP_DEPS}" || -n "${NCCL_BUILD_TRACING_SERVICE}" ]]; then
   build_comms_tracing_service
 fi
 
@@ -402,7 +449,7 @@ mkdir -p "$BUILDDIR"
 pushd "${NCCL_HOME}"
 
 function build_nccl {
-  make VERBOSE=1 -j \
+  make VERBOSE=1 -j4 \
     src.build \
     BUILDDIR="$BUILDDIR" \
     NVCC_GENCODE="$NVCC_GENCODE" \
@@ -418,7 +465,7 @@ function build_nccl {
 }
 
 function build_and_install_nccl {
-make VERBOSE=1 -j \
+make VERBOSE=1 -j4 \
     src.install \
     BUILDDIR="$BUILDDIR" \
     NVCC_GENCODE="$NVCC_GENCODE" \
