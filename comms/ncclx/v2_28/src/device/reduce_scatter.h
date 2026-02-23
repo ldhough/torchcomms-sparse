@@ -58,6 +58,13 @@ namespace {
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    if (work->isSparse) {
+      if (tid == 0) {
+        printf("[SPARSE] runRing: isSparse=%d rank=%d nRanks=%d channelId=%d\n",
+               (int)work->isSparse, ncclShmem.comm.rank, ncclShmem.comm.nRanks, ncclShmem.channelId);
+      }
+      // For now, fall through to dense path so the collective still completes
+    }
     using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS/REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
     runRing<T, RedOp, Proto>(tid, nthreads, work);
   }

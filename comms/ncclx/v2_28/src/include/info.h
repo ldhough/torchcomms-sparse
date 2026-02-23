@@ -31,6 +31,8 @@ struct ncclInfo {
   int sliceSteps;
   // [META:INFO_EXT] Extension for per-comm algorithm/protocol override
   std::optional<ncclx::algoconf::ncclInfoExt> ext;
+  // Sparse ReduceScatter support
+  uint8_t isSparse;
 };
 
 #endif

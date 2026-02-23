@@ -254,6 +254,8 @@ struct ncclTaskColl {
   uint8_t nChannels;
   // [META:INFO_EXT] Extension for per-comm algorithm/protocol override
   std::optional<ncclx::algoconf::ncclInfoExt> ext;
+  // Sparse ReduceScatter support
+  uint8_t isSparse;
 };
 
 struct ncclTaskP2p {

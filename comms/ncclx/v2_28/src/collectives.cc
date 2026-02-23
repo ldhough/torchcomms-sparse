@@ -237,6 +237,20 @@ ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff, size_t recv
   return ncclEnqueueCheck(&info);
 }
 
+NCCL_API(ncclResult_t, ncclReduceScatterSparse, const void* sendbuff, void* recvbuff, size_t recvcount,
+    ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff, size_t recvcount,
+    ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  SetCudaDevRAII setCudaDev(comm->cudaDev);
+
+  struct ncclInfo info = { ncclFuncReduceScatter, "ReduceScatter",
+    sendbuff, recvbuff, recvcount, datatype, op, 0, comm, stream,
+    REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS };
+  info.isSparse = 1;
+
+  return ncclEnqueueCheck(&info);
+}
+
 NCCL_API(ncclResult_t, ncclScatter, const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, int root, ncclComm* comm, cudaStream_t stream);
 ncclResult_t ncclScatter(const void* sendbuff, void* recvbuff, size_t count,

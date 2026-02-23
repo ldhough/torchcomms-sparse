@@ -542,6 +542,15 @@ ncclResult_t pncclReduceScatter(const void* sendbuff, void* recvbuff,
     size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
     cudaStream_t stream);
 
+/* Sparse ReduceScatter
+ *
+ * Same semantics as ncclReduceScatter but uses sparse/compressed communication.
+ * Currently falls through to dense path with a diagnostic print.
+ */
+ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff,
+    size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
+    cudaStream_t stream);
+
 /*
  * All-Gather
  *

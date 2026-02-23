@@ -304,6 +304,8 @@ struct alignas(16) ncclDevWorkColl {
     } collnet;
   };
   uint64_t redOpArg;
+  // Sparse ReduceScatter support
+  uint8_t isSparse;
 };
 
 
