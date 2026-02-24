@@ -7,6 +7,7 @@
 #include "device.h"
 #include "collectives.h"
 #include "primitives.h"
+#include "ccd.cuh"
 
 namespace {
   template<typename T, typename RedOp, typename Proto>
@@ -53,17 +54,313 @@ namespace {
       prims.recvReduceCopy(offset, dataOffset, nelem, /*postOp=*/true);
     }
   }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Sparse helpers: thin wrappers around polling and signaling for the
+  // header-based sparse ring protocol (runRingSparse).
+  //////////////////////////////////////////////////////////////////////////////
+
+  // Wait until the send FIFO has room: poll sendConn->head until head + NCCL_STEPS > step.
+  // sendConn->head is written by the consumer (proxy or peer) to return credits.
+  __device__ __forceinline__
+  void sparseWaitSend(uint64_t* headPtr, uint64_t step) {
+    int spins = 0;
+    int abort = 0;
+    while (ld_volatile_global(headPtr) + NCCL_STEPS <= step) {
+      if (checkAbort(abort, 1, spins)) break;
+    }
+  }
+
+  // Signal that data has been written to send slot: fence + advance tail + set connFifo.size.
+  __device__ __forceinline__
+  void sparsePostSend(uint64_t* tailPtr, uint64_t step, ncclConnFifo* connFifo, size_t totalBytes) {
+    fence_acq_rel_sys();
+    if (connFifo != nullptr) {
+      connFifo[step % NCCL_STEPS].size = totalBytes;
+    }
+    st_relaxed_sys_global(tailPtr, step + 1);
+  }
+
+  // Wait until recv data is ready: poll recvConn->tail until tail > step.
+  // recvConn->tail is written by the producer (proxy or peer) after data arrives.
+  __device__ __forceinline__
+  void sparseWaitRecv(uint64_t* tailPtr, uint64_t step) {
+    int spins = 0;
+    int abort = 0;
+    while (ld_volatile_global(tailPtr) <= step) {
+      if (checkAbort(abort, 1, spins)) break;
+    }
+  }
+
+  // Return recv credits: advance recvConn->head.
+  __device__ __forceinline__
+  void sparsePostRecv(uint64_t* headPtr, uint64_t step) {
+    st_relaxed_sys_global(headPtr, step + 1);
+  }
+
+  // Cooperative memcpy: all threads copy nbytes from src to dst using 16-byte loads.
+  __device__ __forceinline__
+  void sparseMemcpy(
+    char* __restrict__ dst, const char* __restrict__ src,
+    size_t nbytes, int tid, int nthreads
+  ) {
+    // Use int4 (16-byte) loads/stores for coalescing
+    int4* dst4 = (int4*) dst;
+    const int4* src4 = (const int4*) src;
+    size_t n16 = nbytes / 16;
+    for (size_t i = tid; i < n16; i += nthreads) {
+      dst4[i] = src4[i];
+    }
+    // Handle remainder bytes (thread 0 only)
+    size_t done = n16 * 16;
+    if (tid == 0) {
+      for (size_t i = done; i < nbytes; i++) {
+        dst[i] = src[i];
+      }
+    }
+  }
+
+  // Cooperative element-wise reduce: dst[i] = RedOp(a[i], b[i])
+  // Uses NCCL's Apply_Reduce which handles half, bf16, fp8, etc.
+  template<typename T, typename RedOp>
+  __device__ __forceinline__
+  void sparseReduce(
+    T* __restrict__ dst,
+    const T* __restrict__ a,
+    const T* __restrict__ b,
+    size_t nelem, int tid, int nthreads, uint64_t redOpArg
+  ) {
+    RedOp op(redOpArg);
+    for (size_t i = tid; i < nelem; i += nthreads) {
+      BytePack<sizeof(T)> pa = toPack<T>(a[i]);
+      BytePack<sizeof(T)> pb = toPack<T>(b[i]);
+      BytePack<sizeof(T)> result = Apply_Reduce<RedOp, 1>::reduce(op, pa, pb);
+      dst[i] = fromPack<T>(result);
+    }
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // runRingSparse: header-based ring ReduceScatter
+  //
+  // Each send is: [SparseChunkHeader][payload]. The receiver reads the header
+  // to learn payload_bytes. Currently sends dense data (payload_bytes =
+  // nelem*sizeof(T)) to validate the protocol before adding compression.
+  //
+  // Uses chunkSteps=1, sliceSteps=1 → one FIFO slot per chunk per ring step.
+  // The 8-slot FIFO (NCCL_STEPS=8) provides cross-chunk buffering.
+  //////////////////////////////////////////////////////////////////////////////
+  template<typename T, typename RedOp>
+  __device__ void runRingSparse(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    ncclRing *ring = &ncclShmem.channel.ring;
+    int const *ringRanks = ring->userRanks;
+    const int nranks = ncclShmem.comm.nRanks;
+    const int rank = ncclShmem.comm.rank;
+
+    // Use ProtoSimple<1,1> for chunk/slice partitioning with chunkSteps=1, sliceSteps=1
+    const int protoId = NCCL_PROTO_SIMPLE;
+    size_t count;       // elements per rank in the full tensor
+    size_t gridOffset;  // element offset where this channel starts
+    size_t channelCount;// elements this channel handles
+    size_t chunkCount;  // max elements per chunk
+    ncclCollCbdPart(work, ncclShmem.channelId, protoId, sizeof(T),
+                    &count, &gridOffset, &channelCount, &chunkCount);
+
+    // Access send/recv connections directly (bypass Primitives)
+    ncclDevChannelPeer* nextPeer = ncclShmem.channel.peers[ring->next];
+    ncclDevChannelPeer* prevPeer = ncclShmem.channel.peers[ring->prev];
+    ncclConnInfo* sendConn = &nextPeer->send[0];
+    ncclConnInfo* recvConn = &prevPeer->recv[0];
+
+    // Transport buffers and step counters
+    char* sendBuf = sendConn->buffs[NCCL_PROTO_SIMPLE];
+    char* recvBuf = recvConn->buffs[NCCL_PROTO_SIMPLE];
+    int stepSize = sendConn->stepSize;
+    ncclConnFifo* sendFifo = sendConn->connFifo; // may be null for P2P
+
+    // Sparse path requires NCCL_BUFFSIZE >= 16 MiB (stepSize >= 2 MiB) so that
+    // worst-case compressed formats (COO = 2× dense + header) fit in one slot.
+    // Set NCCL_BUFFSIZE=16777216 in the environment. This check runs once per
+    // collective (not per chunk), so has zero perf cost.
+    if (tid == 0 && stepSize < 2 * 1024 * 1024) {
+      printf("[SPARSE-RING] FATAL: stepSize=%d too small for sparse path. "
+             "Set NCCL_BUFFSIZE=16777216 (16 MiB). Need stepSize >= 2 MiB.\n",
+             stepSize);
+      __trap();
+    }
+
+    // With NCCL_BUFFSIZE increased (e.g., 16 MiB), ncclCollCbdPart computes a
+    // larger chunkCount than dense NCCL would with default 4 MiB buffers. We
+    // clamp chunkCount to the dense-equivalent value so the number of chunks
+    // (and thus P2P messages) is identical to stock dense NCCL. The enlarged
+    // slots provide headroom for sparse format overhead (COO = 2× dense, SPOP
+    // ≈ 1.03× dense) + header without needing extra messages.
+    const size_t headerSize = sizeof(SparseChunkHeader);
+
+    // Initialize step counters from connection state.
+    // With chunkSteps=1, sliceSteps=1, each chunk/step uses exactly 1 FIFO slot.
+    uint64_t sendStep = sendConn->step;
+    uint64_t recvStep = recvConn->step;
+
+    // Initialize recv credits: tell the sender we're ready for data
+    if (tid == 0) {
+      st_relaxed_sys_global(recvConn->head, recvStep);
+    }
+
+    T* sendbuff = (T*)work->sendbuff;
+    T* recvbuff = (T*)work->recvbuff;
+
+    if (tid == 0) {
+      printf("[SPARSE-RING] rank=%d nranks=%d channel=%d count=%lu gridOffset=%lu "
+             "channelCount=%lu chunkCount=%lu stepSize=%d sendBuf=%p recvBuf=%p "
+             "sendFifo=%p\n",
+             rank, nranks, ncclShmem.channelId,
+             (unsigned long)count, (unsigned long)gridOffset,
+             (unsigned long)channelCount, (unsigned long)chunkCount,
+             stepSize, sendBuf, recvBuf, sendFifo);
+    }
+
+    for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+      uint32_t nelem = min(chunkCount, channelCount - elemOffset);
+      size_t dataOffset = gridOffset + elemOffset;
+      size_t payloadBytes = nelem * sizeof(T);
+      size_t totalBytes = headerSize + payloadBytes;
+
+      /////////////// Ring step 0: SEND ///////////////
+      {
+        int rankDest = ringRanks[nranks - 1];
+        size_t srcOffset = dataOffset + rankDest * count;
+
+        // Wait for send buffer availability
+        if (tid == 0) {
+          sparseWaitSend(sendConn->head, sendStep);
+        }
+        __syncthreads();
+
+        // Compute slot pointer
+        char* sendSlot = sendBuf + (sendStep % NCCL_STEPS) * stepSize;
+
+        // Thread 0 writes header
+        if (tid == 0) {
+          SparseChunkHeader* hdr = (SparseChunkHeader*)sendSlot;
+          hdr->payload_bytes = payloadBytes;
+        }
+
+        // All threads cooperatively copy source data after header
+        sparseMemcpy(sendSlot + headerSize,
+                     (const char*)(sendbuff + srcOffset),
+                     payloadBytes, tid, nthreads);
+
+        __syncthreads();
+
+        // Post send
+        if (tid == 0) {
+          sparsePostSend(sendConn->tail, sendStep, sendFifo, totalBytes);
+        }
+        sendStep++;
+      }
+
+      /////////////// Ring steps 1..nranks-2: RECV + REDUCE + SEND ///////////////
+      for (int j = 2; j < nranks; ++j) {
+        int rankDest = ringRanks[nranks - j];
+        size_t srcOffset = dataOffset + rankDest * count;
+
+        // Wait for recv data
+        if (tid == 0) {
+          sparseWaitRecv(recvConn->tail, recvStep);
+        }
+        __syncthreads();
+
+        char* recvSlot = recvBuf + (recvStep % NCCL_STEPS) * stepSize;
+
+        // Read header (thread 0 reads, broadcast via shared mem not needed —
+        // all threads can read from the same location after the sync)
+        size_t recvPayload = ((SparseChunkHeader*)recvSlot)->payload_bytes;
+        size_t recvNelem = recvPayload / sizeof(T);
+
+        // Wait for send buffer availability
+        if (tid == 0) {
+          sparseWaitSend(sendConn->head, sendStep);
+        }
+        __syncthreads();
+
+        char* sendSlot = sendBuf + (sendStep % NCCL_STEPS) * stepSize;
+
+        // Thread 0 writes header (same payload size — dense for now)
+        if (tid == 0) {
+          SparseChunkHeader* hdr = (SparseChunkHeader*)sendSlot;
+          hdr->payload_bytes = payloadBytes;
+        }
+
+        // Reduce: local[srcOffset..] + recv payload → send payload
+        T* recvData = (T*)(recvSlot + headerSize);
+        T* sendData = (T*)(sendSlot + headerSize);
+        T* localData = sendbuff + srcOffset;
+
+        sparseReduce<T, RedOp>(sendData, localData, recvData,
+                        min((size_t)nelem, recvNelem), tid, nthreads, work->redOpArg);
+
+        __syncthreads();
+
+        // Post recv credits
+        if (tid == 0) {
+          sparsePostRecv(recvConn->head, recvStep);
+        }
+        recvStep++;
+
+        // Post send
+        if (tid == 0) {
+          sparsePostSend(sendConn->tail, sendStep, sendFifo, totalBytes);
+        }
+        sendStep++;
+      }
+
+      /////////////// Ring step nranks-1: RECV + REDUCE + COPY to output ///////////////
+      {
+        int rankDest = ringRanks[0];
+        size_t srcOffset = dataOffset + rankDest * count;
+
+        // Wait for recv data
+        if (tid == 0) {
+          sparseWaitRecv(recvConn->tail, recvStep);
+        }
+        __syncthreads();
+
+        char* recvSlot = recvBuf + (recvStep % NCCL_STEPS) * stepSize;
+        size_t recvPayload = ((SparseChunkHeader*)recvSlot)->payload_bytes;
+        size_t recvNelem = recvPayload / sizeof(T);
+
+        // Reduce: local[srcOffset..] + recv payload → output[dataOffset..]
+        T* recvData = (T*)(recvSlot + headerSize);
+        T* localData = sendbuff + srcOffset;
+        T* outputData = recvbuff + dataOffset;
+
+        sparseReduce<T, RedOp>(outputData, localData, recvData,
+                        min((size_t)nelem, recvNelem), tid, nthreads, work->redOpArg);
+
+        __syncthreads();
+
+        // Post recv credits
+        if (tid == 0) {
+          sparsePostRecv(recvConn->head, recvStep);
+        }
+        recvStep++;
+      }
+    }
+
+    // Store final step values back to connection state
+    if (tid == 0) {
+      sendConn->step = sendStep;
+      recvConn->step = recvStep;
+    }
+  }
 }
 
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     if (work->isSparse) {
-      if (tid == 0) {
-        printf("[SPARSE] runRing: isSparse=%d rank=%d nRanks=%d channelId=%d\n",
-               (int)work->isSparse, ncclShmem.comm.rank, ncclShmem.comm.nRanks, ncclShmem.channelId);
-      }
-      // For now, fall through to dense path so the collective still completes
+      runRingSparse<T, RedOp>(tid, nthreads, work);
+      return;
     }
     using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS/REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
     runRing<T, RedOp, Proto>(tid, nthreads, work);
