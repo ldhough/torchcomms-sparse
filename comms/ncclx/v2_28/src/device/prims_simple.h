@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "network/unpack/unpack.h"
+#include "ccd.cuh"
 #include <cassert>
 
 enum primsMode {
@@ -53,6 +54,7 @@ class Primitives<
   int      connStepSize; // Connection step size
   void*    netDeviceHandle;
   uint64_t accSize;
+  uint8_t isSparse;
 
   // Don't use barrier 0 as it's used by the final sync
   __device__ void barrier() {
@@ -121,7 +123,7 @@ class Primitives<
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
       if ((flags & ConnFifoEnabled) && (flags & (Send * RoleWaitSend)))
-        connFifo[step%NCCL_STEPS].size = nelts*sizeof(T);
+        connFifo[step%NCCL_STEPS].size = isSparse ? sizeof(SparseChunkHeader) + nelts*sizeof(T) : nelts*sizeof(T);
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -146,7 +148,8 @@ class Primitives<
         } else if (flags & DirectRead) {  // empty send
           ptrs[index] = nullptr;
         } else {
-          ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
+          ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize
+              + (isSparse ? sizeof(SparseChunkHeader)/sizeof(T) : 0);
         }
       } else if (!isSendNotRecv && DirectRecv) {
         if (flags & DirectRead) {
@@ -154,13 +157,15 @@ class Primitives<
         } else if (flags & DirectWrite) {
           ptrs[index] = directBuff + dstIx + offset;  // send to next from my output buffer
         } else {
-          ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
+          ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize
+              + (isSparse ? sizeof(SparseChunkHeader)/sizeof(T) : 0);
         }
       }
       else {
         // Yes, for some template arguments this code will be unreachable.  That's fine.
         // coverity[dead_error_line]
-        ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
+        ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize
+            + (isSparse ? sizeof(SparseChunkHeader)/sizeof(T) : 0);
       }
       if (flags & NetDeviceUnpack) {
         ncclNetDeviceIncrementHead(group, index);
@@ -238,6 +243,12 @@ class Primitives<
         /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
          * to 0 to avoid unnecessary workload. */
         int workSize = ncclShmem.aborted ? 0 : sliceSize;
+        // Sparse header protocol: read payload_bytes from recv FIFO header
+        if (Recv && isSparse && workSize > 0) {
+          SparseChunkHeader* hdr = (SparseChunkHeader*)((char*)ncclShmem.groups[group].srcs[Src] - sizeof(SparseChunkHeader));
+          int recvNelem = (int)(hdr->payload_bytes / sizeof(T));
+          workSize = min(workSize, recvNelem);
+        }
         if (flags & AnyNetDeviceUnpack) {
           ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
           // Sync here to make sure all workers are reading from the updated srcs)
@@ -290,6 +301,11 @@ class Primitives<
           // skip data flush.
           workSize = 0;
         }
+        // Sparse header protocol: write payload_bytes to send FIFO header
+        if (Send && isSparse && tid == 0) {
+          SparseChunkHeader* hdr = (SparseChunkHeader*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(SparseChunkHeader));
+          hdr->payload_bytes = (size_t)workSize * sizeof(T);
+        }
         barrier(); // This barrier has a counterpart in following loop
         postPeer<Recv, Send>(0 < workSize);
         offset += sliceSize;
@@ -309,6 +325,14 @@ class Primitives<
       { // Only workers could have Wait roles so we know the slice must be empty
         // since we've exited the loop above.
         waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(0, 0, 0, sliceSize);
+      }
+      // Sparse header protocol: write header for non-worker slices.
+      // Use RoleWaitSend (not tid==0) because there's no subBarrier here,
+      // and only the WaitSend thread is guaranteed to see dsts[Dst] it set in waitPeer.
+      if (Send && isSparse && (flags & RoleWaitSend)) {
+        int ws = ncclShmem.aborted ? 0 : sliceSize;
+        SparseChunkHeader* hdr = (SparseChunkHeader*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(SparseChunkHeader));
+        hdr->payload_bytes = (size_t)ws * sizeof(T);
       }
       barrier(); // Has couterpart in preceding worker-only loop.
       int workSize = ncclShmem.aborted ? 0 : sliceSize;
@@ -592,6 +616,7 @@ private:
     int peer = -1;
     flags = 0;
     index = -1;
+    isSparse = collWork ? collWork->isSparse : 0;
     if (mode == primsModeDefault) { // Connect to ranks in sendPeers/recvPeers
       // For send operations, we need an extra warp to overlap the threadfence and the copy
       this->nworkers = nthreads - (MaxSend > 0 && nthreads >= NCCL_SIMPLE_EXTRA_GROUP_IF_NTHREADS_GE ? WARP_SIZE : 0);

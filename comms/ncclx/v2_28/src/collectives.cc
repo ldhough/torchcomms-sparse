@@ -245,7 +245,7 @@ ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff, size_
 
   struct ncclInfo info = { ncclFuncReduceScatter, "ReduceScatter",
     sendbuff, recvbuff, recvcount, datatype, op, 0, comm, stream,
-    /* chunkSteps */ 1, /* sliceSteps */ 1 };
+    REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS };
   info.isSparse = 1;
 
   return ncclEnqueueCheck(&info);

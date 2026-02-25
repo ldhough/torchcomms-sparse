@@ -1976,6 +1976,15 @@ static ncclResult_t getAlgoInfo(
   float collCostTable[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
   initCollCostTable((float **)collCostTable);
   NCCLCHECK(updateCollCostTable(comm, info, nBytes, collNetSupport, nvlsSupport, numPipeOps, (float **)collCostTable));
+  // Sparse path: force Ring+Simple so topoGetAlgoInfo naturally selects it
+  if (info->isSparse) {
+    for (int a = 0; a < NCCL_NUM_ALGORITHMS; a++) {
+      for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
+        if (a != NCCL_ALGO_RING || p != NCCL_PROTO_SIMPLE)
+          collCostTable[a][p] = NCCL_ALGO_PROTO_IGNORE;
+      }
+    }
+  }
   if (comm->tuner != NULL) {
     NCCLCHECK(ncclRegFind(comm, info->sendbuff, sendbuffSize, &regSendBuf));
     NCCLCHECK(ncclRegFind(comm, info->recvbuff, recvbuffSize, &regRecvBuf));
@@ -2067,15 +2076,6 @@ static ncclResult_t calcCollChunking(
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   int chunkSize = stepSize*chunkSteps;
-  // Sparse path: clamp chunkSize to the dense-equivalent value (default 4 MiB
-  // NCCL_BUFFSIZE / NCCL_STEPS).  The enlarged NCCL_BUFFSIZE gives bigger slots
-  // for sparse format overhead, but the number of P2P messages must match stock
-  // dense NCCL.  The device kernel applies the same clamp via ncclCollCbdPart.
-  if (info->isSparse) {
-    int defaultStepSize = (1 << 22) / NCCL_STEPS; // 512 KiB
-    int denseChunkSize = defaultStepSize * chunkSteps;
-    if (chunkSize > denseChunkSize) chunkSize = denseChunkSize;
-  }
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
 
