@@ -2076,6 +2076,17 @@ static ncclResult_t calcCollChunking(
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   int chunkSize = stepSize*chunkSteps;
+  // Sparse path: clamp chunkSize to the dense-equivalent value (default 4 MiB
+  // NCCL_BUFFSIZE / NCCL_STEPS).  The enlarged NCCL_BUFFSIZE gives bigger FIFO
+  // slots for the SparseChunkHeader + sparse format overhead (up to 2× dense
+  // for COO), but the data per slice must be smaller than the slot so there's
+  // headroom.  Without this clamp, sliceSize == slot size and the 16-byte
+  // header causes a buffer overflow.
+  if (info->isSparse) {
+    int defaultStepSize = (1 << 22) / NCCL_STEPS; // 512 KiB (dense default)
+    int denseChunkSize = defaultStepSize * chunkSteps;
+    if (chunkSize > denseChunkSize) chunkSize = denseChunkSize;
+  }
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
 
