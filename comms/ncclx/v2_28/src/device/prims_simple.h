@@ -123,7 +123,7 @@ class Primitives<
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
       if ((flags & ConnFifoEnabled) && (flags & (Send * RoleWaitSend)))
-        connFifo[step%NCCL_STEPS].size = isSparse ? sizeof(SparseChunkHeader) + nelts*sizeof(T) : nelts*sizeof(T);
+        connFifo[step%NCCL_STEPS].size = isSparse ? sizeof(CcdSparseChunkHeader) + nelts*sizeof(T) : nelts*sizeof(T);
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -149,7 +149,7 @@ class Primitives<
           ptrs[index] = nullptr;
         } else {
           ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize
-              + (isSparse ? sizeof(SparseChunkHeader)/sizeof(T) : 0);
+              + (isSparse ? sizeof(CcdSparseChunkHeader)/sizeof(T) : 0);
         }
       } else if (!isSendNotRecv && DirectRecv) {
         if (flags & DirectRead) {
@@ -158,14 +158,14 @@ class Primitives<
           ptrs[index] = directBuff + dstIx + offset;  // send to next from my output buffer
         } else {
           ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize
-              + (isSparse ? sizeof(SparseChunkHeader)/sizeof(T) : 0);
+              + (isSparse ? sizeof(CcdSparseChunkHeader)/sizeof(T) : 0);
         }
       }
       else {
         // Yes, for some template arguments this code will be unreachable.  That's fine.
         // coverity[dead_error_line]
         ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize
-            + (isSparse ? sizeof(SparseChunkHeader)/sizeof(T) : 0);
+            + (isSparse ? sizeof(CcdSparseChunkHeader)/sizeof(T) : 0);
       }
       if (flags & NetDeviceUnpack) {
         ncclNetDeviceIncrementHead(group, index);
@@ -243,68 +243,148 @@ class Primitives<
         /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
          * to 0 to avoid unnecessary workload. */
         int workSize = ncclShmem.aborted ? 0 : sliceSize;
-        // Sparse header protocol: read payload_bytes from recv FIFO header
-        if (Recv && isSparse && workSize > 0) {
-          SparseChunkHeader* hdr = (SparseChunkHeader*)((char*)ncclShmem.groups[group].srcs[Src] - sizeof(SparseChunkHeader));
-          int recvNelem = (int)(hdr->payload_bytes / sizeof(T));
-          workSize = min(workSize, recvNelem);
-        }
-        if (flags & AnyNetDeviceUnpack) {
-          ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
-          // Sync here to make sure all workers are reading from the updated srcs)
-          subBarrier();
-        }
 
-        if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
-            /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
-             * so we need to check whether MultimemSrcs and MultimemDsts are 0. */
-            && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
-          // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
-          if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
-            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
-              (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
-               1, ncclShmem.groups[group].srcs,
-               fan.nsend(), ncclShmem.groups[group].dsts+1,
-               workSize);
+        if (isSparse && Send && workSize > 0) {
+          // ============================================================
+          // CCD SPOP Compress: sendbuff → send FIFO slot
+          // ============================================================
+          // Replaces reduceCopy for sparse send (step 0 and recvReduceSend).
+          // FIFO slot layout: [CcdSparseChunkHeader][bv][inds][values]
+          // Each section padded to 16 bytes for int4 alignment.
+          //
+          // TODO: For recvReduceSend (Recv && Send), scatter-add should
+          // decompress recv FIFO into sendbuff BEFORE this compress.
+          // Not yet implemented — currently only local sendbuff data is compressed.
+
+          // Source: sendbuff slice (srcs[0] set by tid==0 above)
+          T* ccd_dense_src = (T*)ncclShmem.groups[group].srcs[0];
+          // FIFO pointer (dsts[Dst] already offset past header by waitPeer)
+          char* ccd_after_hdr = (char*)ncclShmem.groups[group].dsts[Dst];
+
+          // Virtual 2D shape for SPOP 64×64 tiling.
+          // Column of tiles: M=64 so each tile is a contiguous 4096-element
+          // (16 KB) block in the flat array — optimal memory coalescing.
+          // Row stride = M = 64 floats = 256 bytes (L2 cache friendly).
+          const size_t ccd_M = 64;
+          const size_t ccd_N = (size_t)workSize / 64;
+          const size_t ccd_total_tiles = ceil_div(ccd_N, (size_t)64);
+                                         // tiles_in_N = total_tiles, tiles_in_M = 1
+          const size_t ccd_num_inds = ccd_total_tiles + 1;
+
+          // Compute section sizes and padded offsets within FIFO slot.
+          // Layout after header: [bv | pad | inds | pad | values]
+          const size_t ccd_bv_bytes   = ccd_total_tiles * 64 * sizeof(uint64_t);
+          const size_t ccd_bv_padded  = ccd_pad16(ccd_bv_bytes);
+          const size_t ccd_inds_bytes = ccd_num_inds * sizeof(unsigned);
+          const size_t ccd_inds_padded = ccd_pad16(ccd_inds_bytes);
+          const size_t ccd_vals_offset = ccd_bv_padded + ccd_inds_padded;
+
+          // Pointers into the FIFO slot
+          uint64_t* ccd_bv   = (uint64_t*)ccd_after_hdr;
+          unsigned* ccd_inds  = (unsigned*)(ccd_after_hdr + ccd_bv_padded);
+          T* ccd_vals         = (T*)(ccd_after_hdr + ccd_vals_offset);
+
+          // subBarrier index (same barrier used by Primitives::subBarrier)
+          int ccd_bar = 15 - group - (nworkers != nthreads ? 1 : 0);
+
+          ccd_fused_single_block_spop_compress<T, unsigned>(
+              ccd_dense_src, ccd_vals,
+              ccd_N, ccd_M,
+              ccd_bv, ccd_inds,
+              0, nworkers / warpSize - 1,
+              ccd_bar, nworkers
+          );
+          // compress returns after internal barrier_sync — all workers synced.
+
+          // Read nnz from prefix sum (written by threadIdx.x==0 inside compress)
+          size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+          size_t ccd_payload = ccd_vals_offset + ccd_nnz * sizeof(T);
+
+          // Write header with offsets so receiver can locate each section
+          if (tid == 0) {
+            CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_after_hdr - sizeof(CcdSparseChunkHeader));
+            hdr->payload_bytes = ccd_payload;
+            hdr->nnz = ccd_nnz;
+            hdr->bv_offset = 0;
+            hdr->inds_offset = ccd_bv_padded;
+            hdr->vals_offset = ccd_vals_offset;
           }
-        } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
-          // For broadcast in CollNet to do empty send
-          reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
-            (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
-             Recv, ncclShmem.groups[group].srcs,
-             Dst, ncclShmem.groups[group].dsts,
-             workSize);
-        } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
-          constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
-                                    DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
-          if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
-            // this case should only be directCopySend() with registered buffers and send to net peer
-            reduceCopy<Unroll, RedOp, T,
-              0, Recv + Src, Recv * MaxRecv + Src,
-              0, 1, 1, PreOpSrcs>
-              (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                1, ncclShmem.groups[group].dsts,
-                workSize);
-          } else {
-            reduceCopy<Unroll, RedOp, T,
-              MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
-              MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-              (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
-                workSize);
+
+          // Overwrite connFifo.size (was set to dense size in waitPeer).
+          // Must happen before postPeer's fence_acq_rel_sys so proxy sees
+          // the correct (compressed) transfer size.
+          if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
+            connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
+                sizeof(CcdSparseChunkHeader) + ccd_payload;
           }
+
         } else {
-          // we will come here when calling prims.directSend with net peer,
-          // in this case, ncclShmem.groups[group].dsts[0] == NULL, so we
-          // skip data flush.
-          workSize = 0;
-        }
-        // Sparse header protocol: write payload_bytes to send FIFO header
-        if (Send && isSparse && tid == 0) {
-          SparseChunkHeader* hdr = (SparseChunkHeader*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(SparseChunkHeader));
-          hdr->payload_bytes = (size_t)workSize * sizeof(T);
+          // ============================================================
+          // Dense path (or sparse recv-only, or workSize==0)
+          // ============================================================
+          // Sparse recv header: derive workSize from payload_bytes
+          if (Recv && isSparse && workSize > 0) {
+            CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)((char*)ncclShmem.groups[group].srcs[Src] - sizeof(CcdSparseChunkHeader));
+            int recvNelem = (int)(hdr->payload_bytes / sizeof(T));
+            workSize = min(workSize, recvNelem);
+          }
+          if (flags & AnyNetDeviceUnpack) {
+            ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+            // Sync here to make sure all workers are reading from the updated srcs)
+            subBarrier();
+          }
+
+          if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
+              /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
+               * so we need to check whether MultimemSrcs and MultimemDsts are 0. */
+              && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
+            // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
+            if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
+              reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                (tid, nworkers, /*redArg*/0, /*preOpArgs*/nullptr, /*postOp*/false,
+                 1, ncclShmem.groups[group].srcs,
+                 fan.nsend(), ncclShmem.groups[group].dsts+1,
+                 workSize);
+            }
+          } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
+            // For broadcast in CollNet to do empty send
+            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+              (tid, nworkers, ncclShmem.redOpArgs[0],  nullptr, postOp,
+               Recv, ncclShmem.groups[group].srcs,
+               Dst, ncclShmem.groups[group].dsts,
+               workSize);
+          } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+            constexpr int PreOpSrcs = SrcBuf != Input ? 0 :
+                                      DirectRecv*MaxRecv == NCCL_MAX_DIRECT_ARITY ? (1+NCCL_MAX_DIRECT_ARITY) : 1;
+            if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
+              // this case should only be directCopySend() with registered buffers and send to net peer
+              reduceCopy<Unroll, RedOp, T,
+                0, Recv + Src, Recv * MaxRecv + Src,
+                0, 1, 1, PreOpSrcs>
+                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                  1, ncclShmem.groups[group].dsts,
+                  workSize);
+            } else {
+              reduceCopy<Unroll, RedOp, T,
+                MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                  Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+                  workSize);
+            }
+          } else {
+            // we will come here when calling prims.directSend with net peer,
+            // in this case, ncclShmem.groups[group].dsts[0] == NULL, so we
+            // skip data flush.
+            workSize = 0;
+          }
+          // Sparse header write (dense-payload path, used until scatter-add replaces this)
+          if (Send && isSparse && tid == 0) {
+            CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
+            hdr->payload_bytes = (size_t)workSize * sizeof(T);
+          }
         }
         barrier(); // This barrier has a counterpart in following loop
         postPeer<Recv, Send>(0 < workSize);
@@ -331,7 +411,7 @@ class Primitives<
       // and only the WaitSend thread is guaranteed to see dsts[Dst] it set in waitPeer.
       if (Send && isSparse && (flags & RoleWaitSend)) {
         int ws = ncclShmem.aborted ? 0 : sliceSize;
-        SparseChunkHeader* hdr = (SparseChunkHeader*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(SparseChunkHeader));
+        CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
         hdr->payload_bytes = (size_t)ws * sizeof(T);
       }
       barrier(); // Has couterpart in preceding worker-only loop.

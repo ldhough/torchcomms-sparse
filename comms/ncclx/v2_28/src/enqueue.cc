@@ -2078,7 +2078,7 @@ static ncclResult_t calcCollChunking(
   int chunkSize = stepSize*chunkSteps;
   // Sparse path: clamp chunkSize to the dense-equivalent value (default 4 MiB
   // NCCL_BUFFSIZE / NCCL_STEPS).  The enlarged NCCL_BUFFSIZE gives bigger FIFO
-  // slots for the SparseChunkHeader + sparse format overhead (up to 2× dense
+  // slots for the CcdSparseChunkHeader + sparse format overhead (up to 2× dense
   // for COO), but the data per slice must be smaller than the slot so there's
   // headroom.  Without this clamp, sliceSize == slot size and the 16-byte
   // header causes a buffer overflow.
