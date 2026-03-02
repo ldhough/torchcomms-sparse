@@ -52,16 +52,14 @@ void ccd_fused_single_block_spop_compress(
     const int nworkers_count
 ) {
     // thread/warp indexing
-    // const unsigned index      = blockIdx.x * blockDim.x + threadIdx.x;
-    // const unsigned stride     = blockDim.x * gridDim.x;
-    const unsigned num_warps  = warp_end_idx + 1 - warp_start_idx;          // stride / warpSize;
-    const unsigned warp_idx   = warp_start_idx + (threadIdx.x / warpSize);  // index / warpSize;
-    const unsigned lane       = threadIdx.x % warpSize;                     // index % warpSize;
+    const unsigned num_warps  = warp_end_idx + 1 - warp_start_idx;
+    const unsigned warp_idx   = warp_start_idx + (threadIdx.x / warpSize);
+    const unsigned lane       = threadIdx.x % warpSize;
     // these include incomplete tiles
     const size_t tiles_in_N   = ceil_div(N, 64);
     const size_t tiles_in_M   = ceil_div(M, 64);
     const size_t total_tiles  = tiles_in_M * tiles_in_N;
-    constexpr ValType comp_zero(0);
+    const ValType comp_zero(0);
 
     if (warp_idx == warp_start_idx && lane == 0) {
         inds[total_tiles] = 0;
@@ -93,7 +91,7 @@ void ccd_fused_single_block_spop_compress(
             for (size_t j = 0; j < rows_to_process; ++j) {
                 size_t full_idx = base_idx + (j * (size_t) M);
                 ValType val = dense[full_idx];
-                uint64_t is_nz = val != comp_zero;
+                uint64_t is_nz = (float)val != 0.0f;
                 col_0_bv |= (is_nz << j);
                 nz_count_0 += (unsigned) is_nz;
             }
@@ -103,11 +101,12 @@ void ccd_fused_single_block_spop_compress(
         uint64_t col_1_bv   = 0;
         unsigned nz_count_1 = 0;
         // process second col in tile for this thread
-        if (lane + warpSize < cols_to_process) { // mask if beyond what needs to be processed
+        // mask if beyond what needs to be processed
+        if (lane + warpSize < cols_to_process) {
             for (size_t j = 0; j < rows_to_process; ++j) {
                 size_t full_idx = base_idx + (j * (size_t) M);
                 ValType val = dense[full_idx];
-                uint64_t is_nz = val != comp_zero;
+                uint64_t is_nz = (float)val != 0.0f;
                 col_1_bv |= (is_nz << j);
                 nz_count_1 += (unsigned) is_nz;
             }
@@ -138,6 +137,7 @@ void ccd_fused_single_block_spop_compress(
             inds[tile_idx] = running;
             running += count;
         }
+        inds[total_tiles] = running;
     }
     barrier_sync(bar, nworkers_count);
     const unsigned dlane = lane * 2;
@@ -204,6 +204,112 @@ void ccd_fused_single_block_spop_compress(
     }
 }
 
+// needs 1D grid, 1D blocks, and >= 32 threads per block, as
+// well as number of threads per block evenly divisible by 32
+template<typename ValType = float, typename IndType = unsigned>
+__device__
+__forceinline__
+void ccd_decompress_or_scatter_into(
+    ValType * __restrict__ dense,
+    const ValType * __restrict__ compressed,
+    const size_t N, // rows
+    const size_t M, // cols
+    const uint64_t * __restrict__ bv,
+    const IndType * __restrict__ inds,
+    const unsigned warp_start_idx,
+    const unsigned warp_end_idx,
+    const bool scatter_into = false
+) {
+    // thread/warp indexing
+    /*
+    unsigned index      = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned stride     = blockDim.x * gridDim.x;
+    unsigned num_warps  = stride / warpSize;
+    unsigned warp_idx   = index / warpSize;
+    unsigned lane       = index % warpSize;
+    unsigned dlane      = lane * 2;
+    */
+    const unsigned num_warps  = warp_end_idx + 1 - warp_start_idx;
+    const unsigned warp_idx   = warp_start_idx + (threadIdx.x / warpSize);
+    const unsigned lane       = threadIdx.x % warpSize;
+    const unsigned dlane      = lane * 2;
+    // these include incomplete tiles
+    size_t tiles_in_N = ceil_div(N, 64);
+    size_t tiles_in_M = ceil_div(M, 64);
+    size_t total_tiles  = tiles_in_M * tiles_in_N;
+    ValType comp_zero(0);
 
+    for (
+        size_t tile_index = warp_idx;
+        tile_index < total_tiles;
+        tile_index += num_warps 
+    ) {
+        size_t idx_N             = tile_index / tiles_in_M;
+        size_t idx_M             = tile_index % tiles_in_M;
+        // number of prior rows * elements in row
+        size_t prior_rowc        = 64 * idx_N;
+        // prior rows * elements in row
+        size_t prior_row_elec    = prior_rowc * M;
+        // number of elements in this row before tile start
+        size_t prior_colc        = 64 * idx_M;
+        size_t base_idx          = prior_row_elec + prior_colc + (size_t) dlane;
+        // determine how many rows and cols to process (normally 64, 64)
+        unsigned cols_after      = M - prior_colc;
+        unsigned cols_to_process = (cols_after < 64) ? cols_after : 64;
+        // unsigned rows_after      = N - prior_rowc;
+        // unsigned rows_to_process = (rows_after < 64) ? rows_after : 64;
+        IndType nz_before_tile = inds[tile_index];
+        // popc two cols, adjacent
+        size_t bv_word_idx = tile_index * 64 + dlane;
+        uint64_t col_0_bv = bv[bv_word_idx];
+        uint64_t col_1_bv = bv[bv_word_idx + 1];
+        // bv includes some ghost elements which are still zeroed
+        unsigned col_0_popc = __popcll(col_0_bv);
+        unsigned col_1_popc = __popcll(col_1_bv);
+        unsigned dcol_popc  = col_0_popc + col_1_popc;
+        unsigned sum = dcol_popc;
+        // prefix sum the cols
+        for (unsigned offset = 1; offset < 32; offset <<= 1) {
+            unsigned rcv = __shfl_up_sync(
+                0xFFFFFFFF, sum, offset
+            );
+           if (lane >= offset) {
+                sum += rcv;
+            }
+        }
+        sum -= dcol_popc;
+        size_t nz_count_0 = sum;
+        size_t nz_count_1 = sum + col_0_popc;
+        nz_count_0 += nz_before_tile;
+        nz_count_1 += nz_before_tile;
+        // scan the appropriate words/cols in bv
+        if (dlane < cols_to_process) {
+            for (size_t idx = 0; idx < col_0_popc; ++idx) {
+                unsigned set_lsb_idx = __ffsll(col_0_bv) - 1;
+                col_0_bv &= (col_0_bv - 1);
+                size_t full_dense_index = base_idx + (set_lsb_idx * M);
+                size_t full_compressed_index = nz_count_0 + idx;
+                if (scatter_into) {
+                    dense[full_dense_index] = (ValType)((float)dense[full_dense_index] + (float)compressed[full_compressed_index]);
+                } else {
+                    dense[full_dense_index] = compressed[full_compressed_index];
+                }
+            }
+        }
+        if (dlane + 1 < cols_to_process) {
+            for (size_t idx = 0; idx < col_1_popc; ++idx) {
+                unsigned set_lsb_idx = __ffsll(col_1_bv) - 1;
+                col_1_bv &= (col_1_bv - 1);
+                size_t full_dense_index = base_idx + 1 + (set_lsb_idx * M);
+                size_t full_compressed_index = nz_count_1 + idx;
+                if (scatter_into) {
+                    dense[full_dense_index] = (ValType)((float)dense[full_dense_index] + (float)compressed[full_compressed_index]);
+                } else {
+                    dense[full_dense_index] = compressed[full_compressed_index];
+                }
+            }
+        }
+    }
+}
 
 #endif /* NCCL_DEVICE_CCD_CUH */
