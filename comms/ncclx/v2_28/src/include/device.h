@@ -306,6 +306,7 @@ struct alignas(16) ncclDevWorkColl {
   uint64_t redOpArg;
   // Sparse ReduceScatter support
   uint8_t isSparse;
+  uint8_t ccdFormatMask;
 };
 
 

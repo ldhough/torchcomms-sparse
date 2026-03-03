@@ -325,6 +325,7 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.netRegUsed = devWork.regUsed = 0;
     devWork.profilerEnabled = ncclProfilerPluginLoaded() && (task->eActivationMask & ncclProfileKernelCh);
     devWork.isSparse = task->isSparse;
+    devWork.ccdFormatMask = task->ccdFormatMask;
     if (task->regBufType & NCCL_NET_REG_BUFFER)
       devWork.netRegUsed = 1;
     if (task->regBufType & (NCCL_IPC_REG_BUFFER | NCCL_NVLS_REG_BUFFER))
@@ -2555,6 +2556,7 @@ static ncclResult_t collTaskAppend(
   // [META:INFO_EXT] Copy ext to task to be handled in ncclPrepareTasks
   t->ext = info->ext;
   t->isSparse = info->isSparse;
+  t->ccdFormatMask = info->ccdFormatMask;
   t->eActivationMask = ncclProfilerApiState.eActivationMask;
   t->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   t->collApiEventHandle = ncclProfilerApiState.collApiEventHandle;

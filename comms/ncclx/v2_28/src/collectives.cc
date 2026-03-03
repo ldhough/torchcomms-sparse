@@ -247,6 +247,8 @@ ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff, size_
     sendbuff, recvbuff, recvcount, datatype, op, 0, comm, stream,
     REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS };
   info.isSparse = 1;
+  const char* fmask = getenv("NCCL_CCD_FORMAT_MASK");
+  info.ccdFormatMask = fmask ? (uint8_t)atoi(fmask) : 0b0111;
 
   return ncclEnqueueCheck(&info);
 }

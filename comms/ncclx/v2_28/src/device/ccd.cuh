@@ -13,14 +13,23 @@
 // Byte offsets stored in header so receiver can locate each section.
 
 __device__ __forceinline__
-size_t ccd_pad16(size_t x) { return (x + 15) & ~(size_t)15; }
+size_t ccd_pad16(size_t x) {
+    return (x + 15) & ~(size_t) 15;
+}
+
+__host__ __device__ __forceinline__
+size_t ceil_div(size_t a, size_t b) {
+    return (a + b - 1) / b;
+}
+
 
 struct __align__(16) CcdSparseChunkHeader {
   size_t payload_bytes;  // total bytes after header (bv + padding + inds + padding + values)
   size_t nnz;            // number of nonzero values
-  size_t bv_offset;      // byte offset from after header to bitvector (always 0)
-  size_t inds_offset;    // byte offset from after header to tile prefix sums
-  size_t vals_offset;    // byte offset from after header to packed values
+  size_t bv_offset;      // byte offset from after header to bitvector (SPOP only)
+  size_t inds_offset;    // byte offset from after header to tile prefix sums (SPOP only)
+  size_t vals_offset;    // byte offset from after header to packed values (SPOP: after bv+inds, COO1D/DENSE: 0)
+  size_t format;         // CcdCompressionProtocol enum value
 };
 
 enum CcdCompressionProtocol {
@@ -30,10 +39,56 @@ enum CcdCompressionProtocol {
     ADAPTIVE
 };
 
+// ex: 0.1 for 10% density
 __device__ __forceinline__
-size_t ceil_div(size_t a, size_t b) {
-    return (a + b - 1) / b;
+float ccd_expected_density(float current_density) {
+    return 2.0f * current_density - current_density * current_density;
 }
+
+template<typename ValType = float, typename IndType = unsigned>
+__host__ __device__ __forceinline__
+size_t ccd_coo_overhead_bytes(size_t nnz) {
+    return nnz * (sizeof(ValType) + sizeof(IndType));
+}
+
+template<typename ValType = float, typename IndType = unsigned>
+__host__ __device__ __forceinline__
+size_t ccd_spop_overhead_bytes(size_t nnz, size_t dense_N) {
+    size_t val_bytes = nnz * sizeof(ValType);
+    size_t bv_bytes = ceil_div(dense_N, 8);
+    size_t ind_bytes = ceil_div(dense_N, 4096) * sizeof(IndType);
+    return val_bytes + bv_bytes + ind_bytes;
+}
+
+#define DENSE_THRESHOLD 0.3
+
+template<typename ValType = float, typename IndType = unsigned>
+__host__ __device__ __forceinline__
+CcdCompressionProtocol select_ccd_compression_protocol(
+    size_t nnz, size_t dense_N, size_t allow_mask
+) {
+    float sparsity = 1.0f - ((float) nnz / (float) dense_N);
+    if (sparsity <= 0.3 && (0b0001 & allow_mask)) {
+        return CcdCompressionProtocol::DENSE;
+    }
+    if (
+        ccd_spop_overhead_bytes(nnz, dense_N) < ccd_coo_overhead_bytes(nnz)
+        && (0b0100 & allow_mask)
+    ) {
+        return CcdCompressionProtocol::SPOP;
+    } else if (0b0010 & allow_mask) {
+        return CcdCompressionProtocol::COO1D;
+    }
+    if (0b0100 & allow_mask) return CcdCompressionProtocol::SPOP;
+    if (0b0010 & allow_mask) return CcdCompressionProtocol::COO1D;
+    if (0b0001 & allow_mask) return CcdCompressionProtocol::DENSE;
+    return CcdCompressionProtocol::SPOP; // absolute last resort
+}
+
+#define CcdMaskDense     0b0001
+#define CcdMaskCOO1D     0b0010
+#define CcdMaskSPOP      0b0100
+#define CcdMaskAll       0b0111
 
 // intended to be used within a single block
 template<typename ValType = float, typename IndType = unsigned>
@@ -49,7 +104,9 @@ void ccd_fused_single_block_spop_compress(
     const unsigned warp_start_idx,
     const unsigned warp_end_idx,
     const int bar,
-    const int nworkers_count
+    const int nworkers_count,
+    CcdCompressionProtocol protocol = CcdCompressionProtocol::SPOP,
+    size_t key_padding_elems = 0
 ) {
     // thread/warp indexing
     const unsigned num_warps  = warp_end_idx + 1 - warp_start_idx;
@@ -139,7 +196,29 @@ void ccd_fused_single_block_spop_compress(
         }
         inds[total_tiles] = running;
     }
+    /*
+    if (warp_idx == 0) {
+        IndType tile0_count = inds[tile_idx];
+        IndType tile1_count = inds[tile_idx + 1];
+        IndType dtile_count  = tile0_count + tile1_count;
+        IndType sum = dtile_count;
+        for (unsigned offset = 1; offset < 32; offset <<= 1) {
+            const unsigned rcv = __shfl_up_sync(
+                0xFFFFFFFF, sum, offset
+            );
+            if (lane >= offset) {
+                sum += rcv;
+            }
+        }
+        sum -= dtile_count;
+        size_t nz_tile_0 = sum;
+        size_t nz_tile_1 = sum + tile0_count;
+        inds[tile_idx] = nz_tile_0;
+        inds[tile_idx + 1] = nz_tile_1;
+    }
+    */
     barrier_sync(bar, nworkers_count);
+    const IndType nnz = inds[total_tiles];
     const unsigned dlane = lane * 2;
     for (
         size_t tile_index = warp_idx;
@@ -190,6 +269,9 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_dense_index = base_idx + (set_lsb_idx * M);
                 const size_t full_compressed_index = nz_count_0 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
+                if (protocol == CcdCompressionProtocol::COO1D) {
+                    ((unsigned*)(compressed + nnz + key_padding_elems))[full_compressed_index] = (unsigned)full_dense_index;
+                }
             }
         }
         if (dlane + 1 < cols_to_process) {
@@ -199,6 +281,9 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_dense_index = base_idx + 1 + (set_lsb_idx * M);
                 const size_t full_compressed_index = nz_count_1 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
+                if (protocol == CcdCompressionProtocol::COO1D) {
+                    ((unsigned*)(compressed + nnz + key_padding_elems))[full_compressed_index] = (unsigned)full_dense_index;
+                }
             }
         }
     }
@@ -309,6 +394,47 @@ void ccd_decompress_or_scatter_into(
                 }
             }
         }
+    }
+}
+
+// COO1D scatter-add: vals[i] += into dense[keys[i]]
+template<typename ValType = float, typename IndType = unsigned>
+__device__ __forceinline__
+void ccd_coo1d_scatter_into(
+    ValType * __restrict__ dense,
+    const ValType * __restrict__ vals,
+    const IndType * __restrict__ keys,
+    const size_t nnz,
+    const unsigned warp_start_idx,
+    const unsigned warp_end_idx
+) {
+    const unsigned num_warps = warp_end_idx + 1 - warp_start_idx;
+    const unsigned warp_idx = warp_start_idx + (threadIdx.x / warpSize);
+    const unsigned lane = threadIdx.x % warpSize;
+    const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
+    const unsigned nthreads = num_warps * warpSize;
+    for (size_t i = tid_local; i < nnz; i += nthreads) {
+        dense[keys[i]] = (ValType)((float)dense[keys[i]] + (float)vals[i]);
+    }
+}
+
+// Dense scatter-add: dst[i] += src[i]
+template<typename T>
+__device__ __forceinline__
+void ccd_dense_scatter_into(
+    T * __restrict__ dst,
+    const T * __restrict__ src,
+    const size_t n,
+    const unsigned warp_start_idx,
+    const unsigned warp_end_idx
+) {
+    const unsigned num_warps = warp_end_idx + 1 - warp_start_idx;
+    const unsigned warp_idx = warp_start_idx + (threadIdx.x / warpSize);
+    const unsigned lane = threadIdx.x % warpSize;
+    const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
+    const unsigned nthreads = num_warps * warpSize;
+    for (size_t i = tid_local; i < n; i += nthreads) {
+        dst[i] = (T)((float)dst[i] + (float)src[i]);
     }
 }
 

@@ -256,6 +256,7 @@ struct ncclTaskColl {
   std::optional<ncclx::algoconf::ncclInfoExt> ext;
   // Sparse ReduceScatter support
   uint8_t isSparse;
+  uint8_t ccdFormatMask;
 };
 
 struct ncclTaskP2p {
