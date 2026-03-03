@@ -60,15 +60,16 @@ size_t ccd_spop_overhead_bytes(size_t nnz, size_t dense_N) {
     return val_bytes + bv_bytes + ind_bytes;
 }
 
-#define DENSE_THRESHOLD 0.3
+// Minimum bytes for connFifo.size to avoid transport issues with tiny messages
+#define CCD_MIN_SEND_BYTES 1024
 
 template<typename ValType = float, typename IndType = unsigned>
 __host__ __device__ __forceinline__
 CcdCompressionProtocol select_ccd_compression_protocol(
-    size_t nnz, size_t dense_N, size_t allow_mask
+    size_t nnz, size_t dense_N, size_t allow_mask, float dense_threshold = 0.3f
 ) {
     float sparsity = 1.0f - ((float) nnz / (float) dense_N);
-    if (sparsity <= 0.3 && (0b0001 & allow_mask)) {
+    if (sparsity <= dense_threshold && (0b0001 & allow_mask)) {
         return CcdCompressionProtocol::DENSE;
     }
     if (
@@ -397,24 +398,27 @@ void ccd_decompress_or_scatter_into(
     }
 }
 
-// COO1D scatter-add: vals[i] += into dense[keys[i]]
+// COO1D scatter-add for interleaved KV layout: [key0 val0 key1 val1 ...]
 template<typename ValType = float, typename IndType = unsigned>
 __device__ __forceinline__
 void ccd_coo1d_scatter_into(
     ValType * __restrict__ dense,
-    const ValType * __restrict__ vals,
-    const IndType * __restrict__ keys,
+    const char * __restrict__ data,
     const size_t nnz,
     const unsigned warp_start_idx,
     const unsigned warp_end_idx
 ) {
+    const size_t kv_pair_size = sizeof(IndType) + sizeof(ValType);
     const unsigned num_warps = warp_end_idx + 1 - warp_start_idx;
     const unsigned warp_idx = warp_start_idx + (threadIdx.x / warpSize);
     const unsigned lane = threadIdx.x % warpSize;
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < nnz; i += nthreads) {
-        dense[keys[i]] = (ValType)((float)dense[keys[i]] + (float)vals[i]);
+        const char *pair = data + i * kv_pair_size;
+        IndType key = *((const IndType*) pair);
+        ValType val = *((const ValType*) (pair + sizeof(IndType)));
+        dense[key] = (ValType) ((float) dense[key] + (float) val);
     }
 }
 
@@ -437,5 +441,67 @@ void ccd_dense_scatter_into(
         dst[i] = (T)((float)dst[i] + (float)src[i]);
     }
 }
+
+// COO1D compress: ballot + atomicAdd, writes interleaved KV pairs [key0 val0 key1 val1 ...]
+// Total nnz written to *out_nnz (must point to shared memory). Caller provides
+// the shared counter via out_nnz so it can read the result after this function returns.
+template<typename ValType = float, typename IndType = unsigned>
+__device__
+__forceinline__
+void ccd_coo1d_compress(
+    const ValType * __restrict__ dense,
+    char * __restrict__ compressed,
+    const size_t N, // rows (virtual 2D shape)
+    const size_t M, // cols
+    IndType *out_nnz, // shared memory counter — zeroed and written by this function
+    const unsigned warp_start_idx,
+    const unsigned warp_end_idx,
+    const int bar,
+    const int nworkers_count
+) {
+    if (threadIdx.x == 0) *out_nnz = 0;
+    barrier_sync(bar, nworkers_count);
+
+    // thread/warp indexing
+    const size_t row_len       = warpSize;
+    const size_t kv_pair_size  = sizeof(IndType) + sizeof(ValType);
+    const unsigned full_mask   = 0xFFFFFFFF;
+    const size_t C             = N * M;
+    const unsigned num_warps   = warp_end_idx + 1 - warp_start_idx;
+    const unsigned warp_idx    = warp_start_idx + (threadIdx.x / warpSize);
+    const unsigned lane        = threadIdx.x % warpSize;
+    const size_t rows          = ceil_div(C, row_len);
+    for (size_t row_idx = warp_idx; row_idx < rows; row_idx += num_warps) {
+        // guard last row for out-of-bounds lanes
+        const bool valid       = (row_idx * row_len + lane) < C;
+        const ValType lane_ele = valid ? dense[row_idx * row_len + lane] : (ValType) 0;
+        const unsigned is_nz   = ((float) lane_ele != 0.0f) && valid;
+        const unsigned row_mask = __ballot_sync(full_mask, is_nz);
+        const unsigned nnz_row = __popc(row_mask);
+
+        // lane 0 reserves space for this row's KV pairs, broadcasts offset
+        IndType row_offset_bytes;
+        if (lane == 0) {
+            row_offset_bytes = atomicAdd(out_nnz, (IndType) nnz_row);
+            // convert from nnz count to byte offset
+            row_offset_bytes *= (IndType) kv_pair_size;
+        }
+        row_offset_bytes = __shfl_sync(full_mask, row_offset_bytes, 0);
+
+        if (is_nz) {
+            // count of nonzeroes in lanes before this one
+            const unsigned prefix_mask = ((1u << lane) - 1) & row_mask;
+            const unsigned within_row_offset = __popc(prefix_mask);
+            const unsigned wro_bytes = within_row_offset * kv_pair_size;
+            char *pair = compressed + row_offset_bytes + wro_bytes;
+            *((IndType*) pair) = (IndType) (row_idx * row_len + lane);
+            *((ValType*) (pair + sizeof(IndType))) = lane_ele;
+        }
+    }
+
+    // barrier so caller can read *out_nnz for total nnz
+    barrier_sync(bar, nworkers_count);
+}
+
 
 #endif /* NCCL_DEVICE_CCD_CUH */

@@ -56,6 +56,7 @@ class Primitives<
   uint64_t accSize;
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  float ccdDenseThreshold;
 
   // Don't use barrier 0 as it's used by the final sync
   __device__ void barrier() {
@@ -277,11 +278,9 @@ class Primitives<
                   0, nworkers / warpSize - 1
               );
             } else if (recv_format == CcdCompressionProtocol::COO1D) {
-              // COO1D scatter-add: vals + keys
-              const T* recv_vals = (const T*)ccd_recv_after_hdr;
-              const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + recv_hdr->nnz * sizeof(T));
+              // COO1D scatter-add: interleaved KV pairs
               ccd_coo1d_scatter_into<T, unsigned>(
-                  ccd_dense_buf, recv_vals, recv_keys, recv_hdr->nnz,
+                  ccd_dense_buf, (const char*) ccd_recv_after_hdr, recv_hdr->nnz,
                   0, nworkers / warpSize - 1
               );
             } else {
@@ -316,14 +315,14 @@ class Primitives<
             CcdCompressionProtocol ccd_protocol;
             if (!Recv) {
               // Step 0: no recv header to estimate from, use SPOP if allowed
-              ccd_protocol = select_ccd_compression_protocol<T, unsigned>(0, (size_t)workSize, ccdFormatMask);
+              ccd_protocol = select_ccd_compression_protocol<T, unsigned>(0, (size_t)workSize, ccdFormatMask, ccdDenseThreshold);
             } else {
               // Estimate post-reduce density from recv header
               CcdSparseChunkHeader* recv_hdr = (CcdSparseChunkHeader*)((char*)ncclShmem.groups[group].srcs[Src] - sizeof(CcdSparseChunkHeader));
               float recv_density = (float)recv_hdr->nnz / (float)workSize;
               float expected_density = ccd_expected_density(recv_density);
               size_t expected_nnz = (size_t)(expected_density * (float)workSize);
-              ccd_protocol = select_ccd_compression_protocol<T, unsigned>(expected_nnz, (size_t)workSize, ccdFormatMask);
+              ccd_protocol = select_ccd_compression_protocol<T, unsigned>(expected_nnz, (size_t)workSize, ccdFormatMask, ccdDenseThreshold);
             }
 
             if (ccd_protocol == CcdCompressionProtocol::DENSE) {
@@ -346,53 +345,39 @@ class Primitives<
               }
 
               if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
-                    sizeof(CcdSparseChunkHeader) + ccd_payload;
+                size_t ccd_send_bytes = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                if (ccd_send_bytes < CCD_MIN_SEND_BYTES) ccd_send_bytes = CCD_MIN_SEND_BYTES;
+                connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_bytes;
               }
 
             } else if (ccd_protocol == CcdCompressionProtocol::COO1D) {
-              // COO1D: vals right after header, keys right after vals
-              // BV and inds used as scratch at END of FIFO slot
-              const size_t ccd_num_inds = ccd_total_tiles + 1;
-              const size_t ccd_bv_bytes = ccd_total_tiles * 64 * sizeof(uint64_t);
-              const size_t ccd_inds_bytes = ccd_num_inds * sizeof(unsigned);
-
-              // Place BV+inds scratch at end of slot
-              size_t slot_bytes = (size_t)stepSize * StepPerSlice * sizeof(T);
-              char* slot_base = ccd_send_after_hdr - sizeof(CcdSparseChunkHeader);
-              unsigned* ccd_inds = (unsigned*)(slot_base + slot_bytes - ccd_pad16(ccd_inds_bytes));
-              uint64_t* ccd_bv = (uint64_t*)((char*)ccd_inds - ccd_pad16(ccd_bv_bytes));
-
-              // Vals written to ccd_send_after_hdr (compressed ptr), keys written via key_padding_elems=0
-              T* ccd_vals = (T*)ccd_send_after_hdr;
-
-              ccd_fused_single_block_spop_compress<T, unsigned>(
-                  ccd_dense_buf, ccd_vals,
+              // COO1D: interleaved KV pairs [key0 val0 key1 val1 ...] after header
+              __shared__ unsigned ccd_coo1d_nnz;
+              ccd_coo1d_compress<T, unsigned>(
+                  ccd_dense_buf, ccd_send_after_hdr,
                   ccd_N, ccd_M,
-                  ccd_bv, ccd_inds,
+                  &ccd_coo1d_nnz,
                   0, nworkers / warpSize - 1,
-                  ccd_bar, nworkers,
-                  CcdCompressionProtocol::COO1D,
-                  0  // key_padding_elems: keys immediately after vals
+                  ccd_bar, nworkers
               );
 
-              size_t ccd_nnz = ccd_inds[ccd_total_tiles];
-              // payload = vals (nnz * sizeof(T)) + keys (nnz * sizeof(unsigned))
+              size_t ccd_nnz = (size_t) ccd_coo1d_nnz;
               size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
 
               if (tid == 0) {
-                CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
+                CcdSparseChunkHeader *hdr = (CcdSparseChunkHeader*) (ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
                 hdr->payload_bytes = ccd_payload;
                 hdr->nnz = ccd_nnz;
                 hdr->bv_offset = 0;
                 hdr->inds_offset = 0;
                 hdr->vals_offset = 0;
-                hdr->format = (size_t)CcdCompressionProtocol::COO1D;
+                hdr->format = (size_t) CcdCompressionProtocol::COO1D;
               }
 
               if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
-                    sizeof(CcdSparseChunkHeader) + ccd_payload;
+                size_t ccd_send_bytes = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                if (ccd_send_bytes < CCD_MIN_SEND_BYTES) ccd_send_bytes = CCD_MIN_SEND_BYTES;
+                connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_bytes;
               }
 
             } else {
@@ -431,8 +416,9 @@ class Primitives<
               }
 
               if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
-                    sizeof(CcdSparseChunkHeader) + ccd_payload;
+                size_t ccd_send_bytes = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                if (ccd_send_bytes < CCD_MIN_SEND_BYTES) ccd_send_bytes = CCD_MIN_SEND_BYTES;
+                connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_bytes;
               }
             }
           }
@@ -823,6 +809,7 @@ private:
     index = -1;
     isSparse = collWork ? collWork->isSparse : 0;
     ccdFormatMask = collWork ? collWork->ccdFormatMask : CcdMaskAll;
+    ccdDenseThreshold = collWork ? collWork->ccdDenseThreshold : 0.3f;
     if (mode == primsModeDefault) { // Connect to ranks in sendPeers/recvPeers
       // For send operations, we need an extra warp to overlap the threadfence and the copy
       this->nworkers = nthreads - (MaxSend > 0 && nthreads >= NCCL_SIMPLE_EXTRA_GROUP_IF_NTHREADS_GE ? WARP_SIZE : 0);
