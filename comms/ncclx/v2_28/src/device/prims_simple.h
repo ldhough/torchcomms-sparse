@@ -57,6 +57,8 @@ class Primitives<
   uint8_t isSparse;
   uint8_t ccdFormatMask;
   float ccdDenseThreshold;
+  float ccdTrackedDensity;  // expected post-reduce density of what we send; -1 = unknown
+  float ccdBaseSparsity;    // (1 - d₀), per-rank sparsity factor; -1 = unknown
 
   // Don't use barrier 0 as it's used by the final sync
   __device__ void barrier() {
@@ -202,14 +204,11 @@ class Primitives<
     int slice = 0;
     int offset = 0;
 
-    // CCD sparse: running density estimate for adaptive format selection
-    __shared__ float ccd_running_density;
     // CCD sparse: per-side transport detection (NET vs P2P)
     // ConnFifoEnabled is set only for NET (proxy) connections — P2P has null connFifo.
     __shared__ bool ccd_send_is_net, ccd_recv_is_net;
     if (isSparse) {
       if (tid == 0) {
-        ccd_running_density = 0.0f;
         ccd_send_is_net = false;
         ccd_recv_is_net = false;
       }
@@ -243,6 +242,8 @@ class Primitives<
       //     barrier();
       //     post();
       //   } // Since we no longer unroll, new branch added here
+      bool ccdDensityUpdatedThisStep = false;
+
       #if __CUDA_ARCH__ < 700
         // Above doesn't matter on older hardware.
         #pragma unroll SlicePerChunk
@@ -323,38 +324,57 @@ class Primitives<
                 }
               }
 
-              // Update running density from recv header (only from NET recvs)
-              if (tid == 0) {
-                ccd_running_density = (float)recv_hdr->nnz / (float)workSize;
-              }
             }
           }
 
-          // Barrier: ensures ccd_running_density written by tid==0 in Phase A
-          // is visible to all threads before Phase B reads it for format selection.
-          // Also ensures scatter-add (if any) completes before Phase C.
-          if (Recv && Send) {
-            barrier_sync(ccd_bar, nworkers);
+          // ---- Phase B: Send format selection ----
+          // ccdTrackedDensity tracks the expected post-reduce density of what
+          // we send. Updated once per genericOp call (not per slice).
+          // Uses asymmetric formula: d = 1 - (1-d_recv) * (1-d₀)
+          // because accumulated data (d_recv) is denser than local data (d₀).
+          // ccdBaseSparsity = (1-d₀), captured from step 0 compression or
+          // first NET recv (which always has j=1, so d_recv = d₀).
+          if (!ccdDensityUpdatedThisStep) {
+            ccdDensityUpdatedThisStep = true;
+            if (Recv && ccd_recv_is_net) {
+              // NET recv: observe actual density from header (global mem, committed by waitPeer)
+              CcdSparseChunkHeader* density_hdr = (CcdSparseChunkHeader*)(
+                  (char*)ncclShmem.groups[group].srcs[Src] - sizeof(CcdSparseChunkHeader));
+              float d_recv = (float)density_hdr->nnz / (float)workSize;
+              if (ccdBaseSparsity < 0.0f) {
+                // First NET recv is always step 1 (1 rank's contribution): d_recv = d₀
+                ccdBaseSparsity = 1.0f - d_recv;
+              }
+              // Post-reduce: 1 - (1 - d_recv) * (1 - d₀)
+              ccdTrackedDensity = 1.0f - (1.0f - d_recv) * ccdBaseSparsity;
+            } else if (Recv && ccdTrackedDensity >= 0.0f && ccdBaseSparsity >= 0.0f) {
+              // P2P recv (not step 0): extrapolate one reduce step forward.
+              // Guard on Recv: step 0 (!Recv) sends our own local data, not an
+              // extrapolation of accumulated density. Its actual d₀ is captured
+              // after compression in Phase C. Without this guard, chunk 2+'s
+              // step 0 would extrapolate chunk 1's final density toward 1.0.
+              ccdTrackedDensity = 1.0f - (1.0f - ccdTrackedDensity) * ccdBaseSparsity;
+            }
+            // else: unknown or step 0 → no update (Phase C captures d₀ on step 0)
           }
 
-          // ---- Phase B: Send format selection ----
-          // send_is_compressed: true if we need to compress into send FIFO
-          // send_is_dense_net: true if adaptive selected DENSE but send is NET
           bool send_is_compressed = false;
           CcdCompressionProtocol ccd_protocol = CcdCompressionProtocol::DENSE;
           if (Send) {
             if (!ccd_send_is_net) {
               // P2P send: always dense, no compression needed
               send_is_compressed = false;
+            } else if (!Recv || ccdTrackedDensity < 0.0f) {
+              // Step 0 (!Recv) or no density info: force SPOP.
+              // Step 0 must always compress to capture actual d₀ for
+              // subsequent extrapolation. This also handles chunk 2+
+              // where ccdTrackedDensity is stale from the previous chunk.
+              ccd_protocol = (ccdFormatMask & 4) ? CcdCompressionProtocol::SPOP : CcdCompressionProtocol::DENSE;
+              send_is_compressed = (ccd_protocol != CcdCompressionProtocol::DENSE);
             } else {
-              // NET send: adaptive format selection
-              if (!Recv) {
-                ccd_protocol = select_ccd_compression_protocol<T, unsigned>(0, (size_t)workSize, ccdFormatMask, ccdDenseThreshold);
-              } else {
-                float expected_density = ccd_expected_density(ccd_running_density);
-                size_t expected_nnz = (size_t)(expected_density * (float)workSize);
-                ccd_protocol = select_ccd_compression_protocol<T, unsigned>(expected_nnz, (size_t)workSize, ccdFormatMask, ccdDenseThreshold);
-              }
+              // ccdTrackedDensity already represents expected post-reduce density
+              size_t expected_nnz = (size_t)(ccdTrackedDensity * (float)workSize);
+              ccd_protocol = select_ccd_compression_protocol<T, unsigned>(expected_nnz, (size_t)workSize, ccdFormatMask, ccdDenseThreshold);
               send_is_compressed = (ccd_protocol != CcdCompressionProtocol::DENSE);
             }
           }
@@ -430,6 +450,7 @@ class Primitives<
                   ccd_bv, ccd_inds, 0, nworkers / warpSize - 1,
                   ccd_bar, nworkers, CcdCompressionProtocol::COO1D, 0);
               size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+              ccdTrackedDensity = (float)ccd_nnz / (float)workSize;  // calibrate from actual
               size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
               if (tid == 0) {
                 CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -458,6 +479,7 @@ class Primitives<
                   ccd_bv, ccd_inds, 0, nworkers / warpSize - 1,
                   ccd_bar, nworkers);
               size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+              ccdTrackedDensity = (float)ccd_nnz / (float)workSize;  // calibrate from actual
               size_t ccd_payload = ccd_vals_offset + ccd_nnz * sizeof(T);
               if (tid == 0) {
                 CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -495,6 +517,7 @@ class Primitives<
                     ccd_bv, ccd_inds, 0, nworkers / warpSize - 1,
                     ccd_bar, nworkers, CcdCompressionProtocol::COO1D, 0);
                 size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+                ccdTrackedDensity = (float)ccd_nnz / (float)workSize;  // calibrate from actual
                 size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
                 if (tid == 0) {
                   CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -523,6 +546,7 @@ class Primitives<
                     ccd_bv, ccd_inds, 0, nworkers / warpSize - 1,
                     ccd_bar, nworkers);
                 size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+                ccdTrackedDensity = (float)ccd_nnz / (float)workSize;  // calibrate from actual
                 size_t ccd_payload = ccd_vals_offset + ccd_nnz * sizeof(T);
                 if (tid == 0) {
                   CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -577,6 +601,7 @@ class Primitives<
           } else if (!Recv && Send) {
             // No recv (step 0) + NET send: compress or dense-copy sendbuff → send FIFO
             char* ccd_send_after_hdr = (char*)ncclShmem.groups[group].dsts[Dst];
+            size_t ccd_step0_nnz = 0;  // capture actual nnz for d₀ tracking
 
             if (ccd_protocol == CcdCompressionProtocol::DENSE) {
               // Dense step 0 send
@@ -584,6 +609,7 @@ class Primitives<
                 ((T*)ccd_send_after_hdr)[i] = ccd_dense_buf[i];
               }
               barrier_sync(ccd_bar, nworkers);
+              ccd_step0_nnz = (size_t)workSize;
               size_t ccd_payload = (size_t)workSize * sizeof(T);
               if (tid == 0) {
                 CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -610,6 +636,7 @@ class Primitives<
                   ccd_bv, ccd_inds, 0, nworkers / warpSize - 1,
                   ccd_bar, nworkers, CcdCompressionProtocol::COO1D, 0);
               size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+              ccd_step0_nnz = ccd_nnz;
               size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
               if (tid == 0) {
                 CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -638,6 +665,7 @@ class Primitives<
                   ccd_bv, ccd_inds, 0, nworkers / warpSize - 1,
                   ccd_bar, nworkers);
               size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+              ccd_step0_nnz = ccd_nnz;
               size_t ccd_payload = ccd_vals_offset + ccd_nnz * sizeof(T);
               if (tid == 0) {
                 CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -652,6 +680,13 @@ class Primitives<
                 connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
                     max((int)(sizeof(CcdSparseChunkHeader) + ccd_payload), CCD_MIN_SEND_BYTES);
               }
+            }
+            // Capture d₀ from step 0 compression for asymmetric density extrapolation.
+            // Step 0 sends our own local data, so nnz/workSize = d₀.
+            float ccd_d0 = (float)ccd_step0_nnz / (float)workSize;
+            ccdTrackedDensity = ccd_d0;
+            if (ccdBaseSparsity < 0.0f) {
+              ccdBaseSparsity = 1.0f - ccd_d0;
             }
           }
 
@@ -1029,6 +1064,8 @@ private:
     isSparse = collWork ? collWork->isSparse : 0;
     ccdFormatMask = collWork ? collWork->ccdFormatMask : CcdMaskAll;
     ccdDenseThreshold = collWork ? collWork->ccdDenseThreshold : 0.3f;
+    ccdTrackedDensity = -1.0f;
+    ccdBaseSparsity = -1.0f;
     if (mode == primsModeDefault) { // Connect to ranks in sendPeers/recvPeers
       // For send operations, we need an extra warp to overlap the threadfence and the copy
       this->nworkers = nthreads - (MaxSend > 0 && nthreads >= NCCL_SIMPLE_EXTRA_GROUP_IF_NTHREADS_GE ? WARP_SIZE : 0);
