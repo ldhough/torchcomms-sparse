@@ -60,15 +60,15 @@ size_t ccd_spop_overhead_bytes(size_t nnz, size_t dense_N) {
     return val_bytes + bv_bytes + ind_bytes;
 }
 
-#define DENSE_THRESHOLD 0.3
+#define CCD_MIN_SEND_BYTES 2048
 
 template<typename ValType = float, typename IndType = unsigned>
 __host__ __device__ __forceinline__
 CcdCompressionProtocol select_ccd_compression_protocol(
-    size_t nnz, size_t dense_N, size_t allow_mask
+    size_t nnz, size_t dense_N, size_t allow_mask, float dense_threshold = 0.3f
 ) {
     float sparsity = 1.0f - ((float) nnz / (float) dense_N);
-    if (sparsity <= 0.3 && (0b0001 & allow_mask)) {
+    if (sparsity <= dense_threshold && (0b0001 & allow_mask)) {
         return CcdCompressionProtocol::DENSE;
     }
     if (

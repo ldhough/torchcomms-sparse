@@ -249,6 +249,8 @@ ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff, size_
   info.isSparse = 1;
   const char* fmask = getenv("NCCL_CCD_FORMAT_MASK");
   info.ccdFormatMask = fmask ? (uint8_t)atoi(fmask) : 0b0111;
+  const char* dthresh = getenv("NCCL_CCD_DENSE_THRESHOLD");
+  info.ccdDenseThreshold = dthresh ? atof(dthresh) : 0.3f;
 
   return ncclEnqueueCheck(&info);
 }
