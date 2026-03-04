@@ -106,8 +106,7 @@ void ccd_fused_single_block_spop_compress(
     const unsigned warp_end_idx,
     const int bar,
     const int nworkers_count,
-    CcdCompressionProtocol protocol = CcdCompressionProtocol::SPOP,
-    size_t key_padding_elems = 0
+    CcdCompressionProtocol protocol = CcdCompressionProtocol::SPOP
 ) {
     // thread/warp indexing
     const unsigned num_warps  = warp_end_idx + 1 - warp_start_idx;
@@ -219,7 +218,7 @@ void ccd_fused_single_block_spop_compress(
     }
     */
     barrier_sync(bar, nworkers_count);
-    const IndType nnz = inds[total_tiles];
+    const IndType nnz = *(volatile const IndType*)(inds + total_tiles);
     const unsigned dlane = lane * 2;
     for (
         size_t tile_index = warp_idx;
@@ -271,7 +270,7 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_compressed_index = nz_count_0 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
                 if (protocol == CcdCompressionProtocol::COO1D) {
-                    ((unsigned*)(compressed + nnz + key_padding_elems))[full_compressed_index] = (unsigned)full_dense_index;
+                    ((unsigned*)(compressed + nnz))[full_compressed_index] = (unsigned)full_dense_index;
                 }
             }
         }
@@ -283,7 +282,7 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_compressed_index = nz_count_1 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
                 if (protocol == CcdCompressionProtocol::COO1D) {
-                    ((unsigned*)(compressed + nnz + key_padding_elems))[full_compressed_index] = (unsigned)full_dense_index;
+                    ((unsigned*)(compressed + nnz))[full_compressed_index] = (unsigned)full_dense_index;
                 }
             }
         }
