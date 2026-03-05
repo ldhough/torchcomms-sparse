@@ -56,6 +56,10 @@ class Primitives<
   uint64_t accSize;
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  float ccdDenseThreshold;
+  float ccdTrackedDensity;
+  float ccdBaseDensity;
+  CcdCompressionProtocol ccdStepProtocol;
 
   // Don't use barrier 0 as it's used by the final sync
   __device__ void barrier() {
@@ -312,18 +316,28 @@ class Primitives<
             char* ccd_send_after_hdr = (char*)ncclShmem.groups[group].dsts[Dst];
             int ccd_bar = 15 - group - (nworkers != nthreads ? 1 : 0);
 
-            // Determine compression format for this step
+            // Per-step format selection (first slice of each genericOp call)
             CcdCompressionProtocol ccd_protocol;
-            if (!Recv) {
-              // Step 0: no recv header to estimate from, use SPOP if allowed
-              ccd_protocol = select_ccd_compression_protocol<T, unsigned>(0, (size_t)workSize, ccdFormatMask);
+            if (slice == 0) {
+              if (!Recv) {
+                // Step 0: can't know density before first compression.
+                // Force SPOP if allowed (captures BV+inds for baseline density).
+                // Fall back to selector only if SPOP not in mask.
+                if (ccdFormatMask & CcdMaskSPOP) {
+                  ccd_protocol = CcdCompressionProtocol::SPOP;
+                } else {
+                  ccd_protocol = select_ccd_compression_protocol<T, unsigned>(
+                      (size_t)0, (size_t)workSize, ccdFormatMask, ccdDenseThreshold);
+                }
+              } else {
+                // Step 1+: use tracked density for format selection
+                size_t expected_nnz = (size_t)(ccdTrackedDensity * (float)workSize);
+                ccd_protocol = select_ccd_compression_protocol<T, unsigned>(
+                    expected_nnz, (size_t)workSize, ccdFormatMask, ccdDenseThreshold);
+              }
+              ccdStepProtocol = ccd_protocol;
             } else {
-              // Estimate post-reduce density from recv header
-              CcdSparseChunkHeader* recv_hdr = (CcdSparseChunkHeader*)((char*)ncclShmem.groups[group].srcs[Src] - sizeof(CcdSparseChunkHeader));
-              float recv_density = (float)recv_hdr->nnz / (float)workSize;
-              float expected_density = ccd_expected_density(recv_density);
-              size_t expected_nnz = (size_t)(expected_density * (float)workSize);
-              ccd_protocol = select_ccd_compression_protocol<T, unsigned>(expected_nnz, (size_t)workSize, ccdFormatMask);
+              ccd_protocol = ccdStepProtocol;
             }
 
             if (ccd_protocol == CcdCompressionProtocol::DENSE) {
@@ -346,8 +360,9 @@ class Primitives<
               }
 
               if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
-                    sizeof(CcdSparseChunkHeader) + ccd_payload;
+                ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
+                connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
               }
 
             } else if (ccd_protocol == CcdCompressionProtocol::COO1D) {
@@ -376,7 +391,8 @@ class Primitives<
                   0  // key_padding_elems: keys immediately after vals
               );
 
-              size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+              // Volatile read: nnz written by tid==0 in prefix scan, other threads need it
+              size_t ccd_nnz = *(volatile unsigned*)&ccd_inds[ccd_total_tiles];
               // payload = vals (nnz * sizeof(T)) + keys (nnz * sizeof(unsigned))
               size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
 
@@ -391,8 +407,20 @@ class Primitives<
               }
 
               if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
-                    sizeof(CcdSparseChunkHeader) + ccd_payload;
+                ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
+                connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
+              }
+
+              // Density calibration (COO1D)
+              if (slice == 0) {
+                float actual_density = (float)ccd_nnz / (float)workSize;
+                if (!Recv) {
+                  ccdBaseDensity = actual_density;
+                  ccdTrackedDensity = actual_density;
+                } else {
+                  ccdTrackedDensity = ccd_expected_density(actual_density, ccdBaseDensity);
+                }
               }
 
             } else {
@@ -431,8 +459,20 @@ class Primitives<
               }
 
               if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                connFifo[(step - StepPerSlice) % NCCL_STEPS].size =
-                    sizeof(CcdSparseChunkHeader) + ccd_payload;
+                ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
+                connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
+              }
+
+              // Density calibration (SPOP)
+              if (slice == 0) {
+                float actual_density = (float)ccd_nnz / (float)workSize;
+                if (!Recv) {
+                  ccdBaseDensity = actual_density;
+                  ccdTrackedDensity = actual_density;
+                } else {
+                  ccdTrackedDensity = ccd_expected_density(actual_density, ccdBaseDensity);
+                }
               }
             }
           }
@@ -823,6 +863,10 @@ private:
     index = -1;
     isSparse = collWork ? collWork->isSparse : 0;
     ccdFormatMask = collWork ? collWork->ccdFormatMask : CcdMaskAll;
+    ccdDenseThreshold = collWork ? collWork->ccdDenseThreshold : 0.3f;
+    ccdTrackedDensity = 0.0f;
+    ccdBaseDensity = 0.0f;
+    ccdStepProtocol = CcdCompressionProtocol::SPOP;
     if (mode == primsModeDefault) { // Connect to ranks in sendPeers/recvPeers
       // For send operations, we need an extra warp to overlap the threadfence and the copy
       this->nworkers = nthreads - (MaxSend > 0 && nthreads >= NCCL_SIMPLE_EXTRA_GROUP_IF_NTHREADS_GE ? WARP_SIZE : 0);

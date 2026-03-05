@@ -34,6 +34,7 @@ struct ncclInfo {
   // Sparse ReduceScatter support
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  float ccdDenseThreshold;
 };
 
 #endif

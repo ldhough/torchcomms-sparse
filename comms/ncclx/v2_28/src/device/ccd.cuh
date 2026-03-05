@@ -39,10 +39,12 @@ enum CcdCompressionProtocol {
     ADAPTIVE
 };
 
-// ex: 0.1 for 10% density
+// Asymmetric density extrapolation after one reduce step.
+// d_prev = post-reduce density so far, d_base = fresh local data density (d₀).
+// d_next = 1 - (1 - d_prev)(1 - d_base)
 __device__ __forceinline__
-float ccd_expected_density(float current_density) {
-    return 2.0f * current_density - current_density * current_density;
+float ccd_expected_density(float d_prev, float d_base) {
+    return 1.0f - (1.0f - d_prev) * (1.0f - d_base);
 }
 
 template<typename ValType = float, typename IndType = unsigned>
@@ -60,15 +62,16 @@ size_t ccd_spop_overhead_bytes(size_t nnz, size_t dense_N) {
     return val_bytes + bv_bytes + ind_bytes;
 }
 
-#define DENSE_THRESHOLD 0.3
+#define CCD_MIN_SEND_BYTES 1024
 
 template<typename ValType = float, typename IndType = unsigned>
 __host__ __device__ __forceinline__
 CcdCompressionProtocol select_ccd_compression_protocol(
-    size_t nnz, size_t dense_N, size_t allow_mask
+    size_t nnz, size_t dense_N, size_t allow_mask,
+    float dense_threshold = 0.3f
 ) {
-    float sparsity = 1.0f - ((float) nnz / (float) dense_N);
-    if (sparsity <= 0.3 && (0b0001 & allow_mask)) {
+    float density = (float) nnz / (float) dense_N;
+    if (density >= (1.0f - dense_threshold) && (0b0001 & allow_mask)) {
         return CcdCompressionProtocol::DENSE;
     }
     if (

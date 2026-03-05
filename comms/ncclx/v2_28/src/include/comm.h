@@ -257,6 +257,7 @@ struct ncclTaskColl {
   // Sparse ReduceScatter support
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  float ccdDenseThreshold;
 };
 
 struct ncclTaskP2p {

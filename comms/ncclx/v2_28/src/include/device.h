@@ -307,6 +307,7 @@ struct alignas(16) ncclDevWorkColl {
   // Sparse ReduceScatter support
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  float ccdDenseThreshold;
 };
 
 
