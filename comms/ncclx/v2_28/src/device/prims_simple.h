@@ -128,7 +128,7 @@ class Primitives<
 
     if (flags & (Recv*RoleWaitRecv | Send*RoleWaitSend)) {
       if ((flags & ConnFifoEnabled) && (flags & (Send * RoleWaitSend)))
-        connFifo[step%NCCL_STEPS].size = isSparse ? sizeof(CcdSparseChunkHeader) + nelts*sizeof(T) : nelts*sizeof(T);
+        connFifo[step%NCCL_STEPS].size = nelts*sizeof(T);
 
       void **ptrs = isSendNotRecv ? (ncclShmem.groups[group].dsts + Dst)
                                   : (ncclShmem.groups[group].srcs + Src);
@@ -567,10 +567,11 @@ class Primitives<
         // since we've exited the loop above.
         waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(0, 0, 0, sliceSize);
       }
-      // Sparse header protocol: write zero-payload header for non-worker slices.
-      // Use RoleWaitSend (not tid==0) because there's no subBarrier here,
-      // and only the WaitSend thread is guaranteed to see dsts[Dst] it set in waitPeer.
-      if (Send && isSparse && (flags & RoleWaitSend)) {
+      // Sparse header protocol: write zero-payload header for non-worker slices
+      // that carry data. Empty slices (sliceSize=0) send size=0 with no header,
+      // matching dense NCCL behavior. The recv side's non-worker loop does no
+      // data processing for empty slices regardless.
+      if (Send && isSparse && sliceSize > 0 && (flags & RoleWaitSend)) {
         CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
         hdr->payload_bytes = 0;
         hdr->nnz = 0;
