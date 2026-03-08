@@ -551,6 +551,27 @@ ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff,
     size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
     cudaStream_t stream);
 
+/* Sparse AllGather
+ *
+ * Same semantics as ncclAllGather but uses sparse/compressed communication.
+ * Each rank compresses its chunk before sending; intermediate ring hops relay
+ * compressed data and decompress into the output buffer.
+ */
+ncclResult_t ncclAllGatherSparse(const void* sendbuff, void* recvbuff,
+    size_t sendcount, ncclDataType_t datatype, ncclComm_t comm,
+    cudaStream_t stream);
+
+/* Sparse AllReduce
+ *
+ * Same semantics as ncclAllReduce but uses sparse/compressed communication.
+ * ReduceScatter phase uses scatter-add with compressed data; AllGather phase
+ * relays compressed chunks. Each phase independently decides sparse vs dense
+ * based on tracked density.
+ */
+ncclResult_t ncclAllReduceSparse(const void* sendbuff, void* recvbuff,
+    size_t count, ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
+    cudaStream_t stream);
+
 /*
  * All-Gather
  *

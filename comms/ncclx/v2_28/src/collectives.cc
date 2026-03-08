@@ -251,6 +251,49 @@ ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff, size_
   info.ccdFormatMask = fmask ? (uint8_t)atoi(fmask) : 0b0111;
   const char* dthresh = getenv("NCCL_CCD_DENSE_THRESHOLD");
   info.ccdDenseThreshold = dthresh ? (float)atof(dthresh) : 0.3f;
+  const char* agthresh = getenv("NCCL_CCD_AG_DENSE_THRESHOLD");
+  info.ccdAgDenseThreshold = agthresh ? (float)atof(agthresh) : 0.1f;
+
+  return ncclEnqueueCheck(&info);
+}
+
+NCCL_API(ncclResult_t, ncclAllGatherSparse, const void* sendbuff, void* recvbuff, size_t sendcount,
+    ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream);
+ncclResult_t ncclAllGatherSparse(const void* sendbuff, void* recvbuff, size_t sendcount,
+    ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream) {
+  if (sendcount == 0) return ncclSuccess;
+  SetCudaDevRAII setCudaDev(comm->cudaDev);
+
+  struct ncclInfo info = { ncclFuncAllGather, "AllGather",
+    sendbuff, recvbuff, sendcount, datatype, ncclSum, 0, comm, stream,
+    ALLGATHER_CHUNKSTEPS, ALLGATHER_SLICESTEPS };
+  info.isSparse = 1;
+  const char* fmask = getenv("NCCL_CCD_FORMAT_MASK");
+  info.ccdFormatMask = fmask ? (uint8_t)atoi(fmask) : 0b0111;
+  // Standalone AG: use AG threshold for compression (no RS phase)
+  const char* agthresh = getenv("NCCL_CCD_AG_DENSE_THRESHOLD");
+  info.ccdDenseThreshold = agthresh ? (float)atof(agthresh) : 0.1f;
+  info.ccdAgDenseThreshold = info.ccdDenseThreshold;
+
+  return ncclEnqueueCheck(&info);
+}
+
+NCCL_API(ncclResult_t, ncclAllReduceSparse, const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+ncclResult_t ncclAllReduceSparse(const void* sendbuff, void* recvbuff, size_t count,
+    ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  SetCudaDevRAII setCudaDev(comm->cudaDev);
+
+  struct ncclInfo info = { ncclFuncAllReduce, "AllReduce",
+    sendbuff, recvbuff, count, datatype, op, 0, comm, stream,
+    ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+  info.isSparse = 1;
+  const char* fmask = getenv("NCCL_CCD_FORMAT_MASK");
+  info.ccdFormatMask = fmask ? (uint8_t)atoi(fmask) : 0b0111;
+  const char* dthresh = getenv("NCCL_CCD_DENSE_THRESHOLD");
+  info.ccdDenseThreshold = dthresh ? (float)atof(dthresh) : 0.3f;
+  const char* agthresh = getenv("NCCL_CCD_AG_DENSE_THRESHOLD");
+  info.ccdAgDenseThreshold = agthresh ? (float)atof(agthresh) : 0.1f;
 
   return ncclEnqueueCheck(&info);
 }

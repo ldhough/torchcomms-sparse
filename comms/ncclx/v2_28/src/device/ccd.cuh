@@ -421,6 +421,27 @@ void ccd_coo1d_scatter_into(
     }
 }
 
+// COO1D decompress (overwrite): dst[key] = val
+template<typename ValType, typename IndType>
+__device__ __forceinline__
+void ccd_coo1d_decompress_into(
+    ValType * __restrict__ dense,
+    const ValType * __restrict__ vals,
+    const IndType * __restrict__ keys,
+    const size_t nnz,
+    const unsigned warp_start_idx,
+    const unsigned warp_end_idx
+) {
+    const unsigned num_warps = warp_end_idx + 1 - warp_start_idx;
+    const unsigned warp_idx = warp_start_idx + (threadIdx.x / warpSize);
+    const unsigned lane = threadIdx.x % warpSize;
+    const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
+    const unsigned nthreads = num_warps * warpSize;
+    for (size_t i = tid_local; i < nnz; i += nthreads) {
+        dense[keys[i]] = vals[i];
+    }
+}
+
 // Dense scatter-add: dst[i] += src[i]
 template<typename T>
 __device__ __forceinline__
