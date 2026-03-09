@@ -255,14 +255,13 @@ class Primitives<
           // CCD Sparse path — two modes based on Src template param:
           //
           // RS MODE (Src=1): scatter-add into sendbuff + compress + optional output copy
-          //   send/directSend/directCopySend : Recv=0 Send=1 -> compress (+ copy to output if Dst)
-          //   recvReduceSend                 : Recv=1 Send=1 -> scatter-add then compress
-          //   recvReduceCopy                 : Recv=1 Send=0 Dst=1 -> scatter-add then copy to output
-          //   directRecvReduceCopyDirectSend : Recv=1 Send=1 Dst=1 -> scatter-add, compress, copy (AR transition)
+          // AG MODE (Src=0): decompress to output + relay
           //
-          // AG MODE (Src=0): decompress to output + relay compressed
-          //   directRecvCopyDirectSend : Recv=1 Send=1 Dst=1 → decompress to output + relay
-          //   directRecv              : Recv=1 Send=0 Dst=1 → decompress to output only
+          // When both recv and send formats are DENSE, we use stock
+          // reduceCopy for fused vectorized operation. When send is
+          // compressed (SPOP/COO1D), we use custom compress kernels.
+          // When recv is compressed but send is DENSE, we custom
+          // scatter-add then reduceCopy for the send.
           // ============================================================
 
           // Virtual 2D shape for SPOP 64×64 tiling (column of tiles).
@@ -270,296 +269,377 @@ class Primitives<
           const size_t ccd_N = (size_t)workSize / 64;
           const size_t ccd_total_tiles = ceil_div(ccd_N, (size_t)64);
 
+          // ---- Determine recv format ----
+          CcdCompressionProtocol ccd_recv_fmt = CcdCompressionProtocol::DENSE;
+          CcdSparseChunkHeader* ccd_recv_hdr = nullptr;
+          if (Recv) {
+            char* ccd_ra = (char*)ncclShmem.groups[group].srcs[Src ? Src : 0];
+            ccd_recv_hdr = (CcdSparseChunkHeader*)(ccd_ra - sizeof(CcdSparseChunkHeader));
+            ccd_recv_fmt = (CcdCompressionProtocol)ccd_recv_hdr->format;
+          }
+
+          // ---- Determine send format ----
+          CcdCompressionProtocol ccd_send_fmt = CcdCompressionProtocol::DENSE;
+          if (Send) {
+            float ccd_active_threshold = (Recv && Dst) ? ccdAgDenseThreshold : ccdDenseThreshold;
+            if (slice == 0) {
+              if (!Recv) {
+                // Step 0: force SPOP for baseDensity capture
+                if (ccdFormatMask & CcdMaskSPOP) {
+                  ccd_send_fmt = CcdCompressionProtocol::SPOP;
+                } else {
+                  ccd_send_fmt = select_ccd_compression_protocol<T, unsigned>(
+                      (size_t)0, (size_t)workSize, ccdFormatMask, ccd_active_threshold);
+                }
+              } else {
+                size_t expected_nnz = (size_t)(ccdTrackedDensity * (float)workSize);
+                ccd_send_fmt = select_ccd_compression_protocol<T, unsigned>(
+                    expected_nnz, (size_t)workSize, ccdFormatMask, ccd_active_threshold);
+              }
+              ccdStepProtocol = ccd_send_fmt;
+            } else {
+              ccd_send_fmt = ccdStepProtocol;
+            }
+          }
+
+          bool recv_is_compressed = Recv && (ccd_recv_fmt != CcdCompressionProtocol::DENSE);
+          bool send_is_compressed = Send && (ccd_send_fmt != CcdCompressionProtocol::DENSE);
+
           if (Src) {
             // ============================================================
             // RS MODE: Src is set → sendbuff is accumulation target
             // ============================================================
-            T* ccd_dense_buf = (T*)ncclShmem.groups[group].srcs[0]; // sendbuff
 
-            // ---- Scatter-add: recv FIFO → accumulate into sendbuff ----
-            if (Recv) {
-              char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[Src];
-              CcdSparseChunkHeader* recv_hdr = (CcdSparseChunkHeader*)(ccd_recv_after_hdr - sizeof(CcdSparseChunkHeader));
-              CcdCompressionProtocol recv_format = (CcdCompressionProtocol)recv_hdr->format;
-
-              if (recv_format == CcdCompressionProtocol::DENSE) {
-                const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                ccd_dense_scatter_into<T>(
-                    ccd_dense_buf, recv_vals, (size_t)workSize,
-                    0, nworkers / warpSize - 1
-                );
-              } else if (recv_format == CcdCompressionProtocol::COO1D) {
-                const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + recv_hdr->nnz * sizeof(T));
-                ccd_coo1d_scatter_into<T, unsigned>(
-                    ccd_dense_buf, recv_vals, recv_keys, recv_hdr->nnz,
-                    0, nworkers / warpSize - 1
-                );
-              } else {
-                const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + recv_hdr->bv_offset);
-                const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + recv_hdr->inds_offset);
-                const T* recv_vals        = (const T*)(ccd_recv_after_hdr + recv_hdr->vals_offset);
-                ccd_decompress_or_scatter_into<T, unsigned>(
-                    ccd_dense_buf, recv_vals,
-                    ccd_N, ccd_M,
-                    recv_bv, recv_inds,
-                    0, nworkers / warpSize - 1,
-                    /*scatter_into=*/true
-                );
-              }
-
-              // Barrier: finish scatter-add before compress reads sendbuff
+            if (!recv_is_compressed && !send_is_compressed) {
+              // ---- CASE 1: Both DENSE — fused reduceCopy ----
+              // Header + connFifo.size for send
               if (Send) {
-                int ccd_bar_sa = 15 - group - (nworkers != nthreads ? 1 : 0);
-                barrier_sync(ccd_bar_sa, nworkers);
-              }
-            }
-
-            // ---- Compress: sendbuff → send FIFO ----
-            if (Send) {
-              char* ccd_send_after_hdr = (char*)ncclShmem.groups[group].dsts[Dst];
-              int ccd_bar = 15 - group - (nworkers != nthreads ? 1 : 0);
-
-              CcdCompressionProtocol ccd_protocol;
-              // AR transition (Recv && Dst): compressing for AG phase → use AG threshold
-              float ccd_active_threshold = (Recv && Dst) ? ccdAgDenseThreshold : ccdDenseThreshold;
-              if (slice == 0) {
-                if (!Recv) {
-                  if (ccdFormatMask & CcdMaskSPOP) {
-                    ccd_protocol = CcdCompressionProtocol::SPOP;
-                  } else {
-                    ccd_protocol = select_ccd_compression_protocol<T, unsigned>(
-                        (size_t)0, (size_t)workSize, ccdFormatMask, ccd_active_threshold);
-                  }
-                } else {
-                  size_t expected_nnz = (size_t)(ccdTrackedDensity * (float)workSize);
-                  ccd_protocol = select_ccd_compression_protocol<T, unsigned>(
-                      expected_nnz, (size_t)workSize, ccdFormatMask, ccd_active_threshold);
-                }
-                ccdStepProtocol = ccd_protocol;
-              } else {
-                ccd_protocol = ccdStepProtocol;
-              }
-
-              if (ccd_protocol == CcdCompressionProtocol::DENSE) {
-                for (int i = tid; i < workSize; i += nworkers) {
-                  ((T*)ccd_send_after_hdr)[i] = ccd_dense_buf[i];
-                }
-                barrier_sync(ccd_bar, nworkers);
-
-                size_t ccd_payload = (size_t)workSize * sizeof(T);
                 if (tid == 0) {
-                  CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
-                  hdr->payload_bytes = ccd_payload;
+                  CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(
+                      (char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
+                  hdr->payload_bytes = (size_t)workSize * sizeof(T);
                   hdr->nnz = (size_t)workSize;
-                  hdr->bv_offset = 0;
-                  hdr->inds_offset = 0;
-                  hdr->vals_offset = 0;
+                  hdr->bv_offset = 0; hdr->inds_offset = 0; hdr->vals_offset = 0;
                   hdr->format = (size_t)CcdCompressionProtocol::DENSE;
                 }
-
                 if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                  ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
-                  if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
-                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
+                  ssize_t sz = sizeof(CcdSparseChunkHeader) + (ssize_t)workSize * (ssize_t)sizeof(T);
+                  if (sz < CCD_MIN_SEND_BYTES) sz = CCD_MIN_SEND_BYTES;
+                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = sz;
                 }
+              }
+              // Stock fused recv+reduce+send+output
+              constexpr int PreOpSrcs1 = SrcBuf != Input ? 0 : 1;
+              reduceCopy<Unroll, RedOp, T,
+                  0, Recv+Src, Recv*MaxRecv+Src,
+                  0, Send+Dst, Send*MaxSend+Dst, PreOpSrcs1>
+                  (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+                   Recv*fan.nrecv()+Src, ncclShmem.groups[group].srcs,
+                   Send*fan.nsend()+Dst, ncclShmem.groups[group].dsts,
+                   workSize);
 
-              } else if (ccd_protocol == CcdCompressionProtocol::COO1D) {
-                const size_t ccd_num_inds = ccd_total_tiles + 1;
-                const size_t ccd_bv_bytes = ccd_total_tiles * 64 * sizeof(uint64_t);
-                const size_t ccd_inds_bytes = ccd_num_inds * sizeof(unsigned);
+              // Density extrapolation for DENSE (no ground truth from compression)
+              if (Send && slice == 0 && Recv) {
+                ccdTrackedDensity = ccd_expected_density(ccdTrackedDensity, ccdBaseDensity);
+              }
 
-                size_t slot_bytes = (size_t)stepSize * StepPerSlice * sizeof(T);
-                char* slot_base = ccd_send_after_hdr - sizeof(CcdSparseChunkHeader);
-                unsigned* ccd_inds = (unsigned*)(slot_base + slot_bytes - ccd_pad16(ccd_inds_bytes));
-                uint64_t* ccd_bv = (uint64_t*)((char*)ccd_inds - ccd_pad16(ccd_bv_bytes));
-                T* ccd_vals = (T*)ccd_send_after_hdr;
+            } else if (recv_is_compressed && !send_is_compressed) {
+              // ---- CASE 2: recv=compressed, send=DENSE ----
+              // Custom scatter-add, then reduceCopy for send (+output)
+              T* ccd_dense_buf = (T*)ncclShmem.groups[group].srcs[0];
+              char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[Src];
 
-                ccd_fused_single_block_spop_compress<T, unsigned>(
-                    ccd_dense_buf, ccd_vals,
-                    ccd_N, ccd_M,
-                    ccd_bv, ccd_inds,
-                    0, nworkers / warpSize - 1,
-                    ccd_bar, nworkers,
-                    CcdCompressionProtocol::COO1D,
-                    0
-                );
+              if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
+                const T* recv_vals = (const T*)ccd_recv_after_hdr;
+                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->nnz * sizeof(T));
+                ccd_coo1d_scatter_into<T, unsigned>(
+                    ccd_dense_buf, recv_vals, recv_keys, ccd_recv_hdr->nnz,
+                    0, nworkers / warpSize - 1);
+              } else { // SPOP
+                const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + ccd_recv_hdr->bv_offset);
+                const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->inds_offset);
+                const T* recv_vals        = (const T*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset);
+                ccd_decompress_or_scatter_into<T, unsigned>(
+                    ccd_dense_buf, recv_vals, ccd_N, ccd_M,
+                    recv_bv, recv_inds, 0, nworkers / warpSize - 1,
+                    /*scatter_into=*/true);
+              }
 
-                size_t ccd_nnz = *(volatile unsigned*)&ccd_inds[ccd_total_tiles];
-                size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
+              // Barrier: scatter-add must finish before send reads sendbuff
+              int ccd_bar_sa = 15 - group - (nworkers != nthreads ? 1 : 0);
+              barrier_sync(ccd_bar_sa, nworkers);
 
+              // Header + connFifo.size for send
+              if (Send) {
                 if (tid == 0) {
-                  CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
-                  hdr->payload_bytes = ccd_payload;
-                  hdr->nnz = ccd_nnz;
-                  hdr->bv_offset = 0;
-                  hdr->inds_offset = 0;
-                  hdr->vals_offset = 0;
-                  hdr->format = (size_t)CcdCompressionProtocol::COO1D;
+                  CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(
+                      (char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
+                  hdr->payload_bytes = (size_t)workSize * sizeof(T);
+                  hdr->nnz = (size_t)workSize;
+                  hdr->bv_offset = 0; hdr->inds_offset = 0; hdr->vals_offset = 0;
+                  hdr->format = (size_t)CcdCompressionProtocol::DENSE;
                 }
-
                 if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                  ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
-                  if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
-                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
+                  ssize_t sz = sizeof(CcdSparseChunkHeader) + (ssize_t)workSize * (ssize_t)sizeof(T);
+                  if (sz < CCD_MIN_SEND_BYTES) sz = CCD_MIN_SEND_BYTES;
+                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = sz;
+                }
+              }
+              // reduceCopy: sendbuff → send FIFO + output
+              reduceCopy<Unroll, RedOp, T,
+                  0, 1, 1,
+                  0, Send+Dst, Send*MaxSend+Dst, 0>
+                  (tid, nworkers, 0, nullptr, false,
+                   1, ncclShmem.groups[group].srcs,
+                   Send*fan.nsend()+Dst, ncclShmem.groups[group].dsts,
+                   workSize);
+
+              // Density extrapolation for DENSE (no ground truth from compression)
+              if (Send && slice == 0) {
+                ccdTrackedDensity = ccd_expected_density(ccdTrackedDensity, ccdBaseDensity);
+              }
+
+            } else {
+              // ---- CASE 3/4: send=compressed — full custom path ----
+              T* ccd_dense_buf = (T*)ncclShmem.groups[group].srcs[0];
+
+              // Scatter-add (if Recv)
+              if (Recv) {
+                char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[Src];
+
+                if (ccd_recv_fmt == CcdCompressionProtocol::DENSE) {
+                  ccd_dense_scatter_into<T>(
+                      ccd_dense_buf, (const T*)ccd_recv_after_hdr, (size_t)workSize,
+                      0, nworkers / warpSize - 1);
+                } else if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
+                  const T* recv_vals = (const T*)ccd_recv_after_hdr;
+                  const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->nnz * sizeof(T));
+                  ccd_coo1d_scatter_into<T, unsigned>(
+                      ccd_dense_buf, recv_vals, recv_keys, ccd_recv_hdr->nnz,
+                      0, nworkers / warpSize - 1);
+                } else {
+                  const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + ccd_recv_hdr->bv_offset);
+                  const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->inds_offset);
+                  const T* recv_vals        = (const T*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset);
+                  ccd_decompress_or_scatter_into<T, unsigned>(
+                      ccd_dense_buf, recv_vals, ccd_N, ccd_M,
+                      recv_bv, recv_inds, 0, nworkers / warpSize - 1,
+                      /*scatter_into=*/true);
                 }
 
-                if (slice == 0) {
-                  float actual_density = (float)ccd_nnz / (float)workSize;
-                  if (!Recv) {
-                    ccdBaseDensity = actual_density;
-                    ccdTrackedDensity = actual_density;
-                  } else {
-                    ccdTrackedDensity = ccd_expected_density(actual_density, ccdBaseDensity);
+                if (Send) {
+                  int ccd_bar_sa = 15 - group - (nworkers != nthreads ? 1 : 0);
+                  barrier_sync(ccd_bar_sa, nworkers);
+                }
+              }
+
+              // Compress: sendbuff → send FIFO
+              if (Send) {
+                char* ccd_send_after_hdr = (char*)ncclShmem.groups[group].dsts[Dst];
+                int ccd_bar = 15 - group - (nworkers != nthreads ? 1 : 0);
+
+                if (ccd_send_fmt == CcdCompressionProtocol::COO1D) {
+                  const size_t ccd_num_inds = ccd_total_tiles + 1;
+                  const size_t ccd_bv_bytes = ccd_total_tiles * 64 * sizeof(uint64_t);
+                  const size_t ccd_inds_bytes = ccd_num_inds * sizeof(unsigned);
+
+                  size_t slot_bytes = (size_t)stepSize * StepPerSlice * sizeof(T);
+                  char* slot_base = ccd_send_after_hdr - sizeof(CcdSparseChunkHeader);
+                  unsigned* ccd_inds = (unsigned*)(slot_base + slot_bytes - ccd_pad16(ccd_inds_bytes));
+                  uint64_t* ccd_bv = (uint64_t*)((char*)ccd_inds - ccd_pad16(ccd_bv_bytes));
+                  T* ccd_vals = (T*)ccd_send_after_hdr;
+
+                  ccd_fused_single_block_spop_compress<T, unsigned>(
+                      ccd_dense_buf, ccd_vals,
+                      ccd_N, ccd_M,
+                      ccd_bv, ccd_inds,
+                      0, nworkers / warpSize - 1,
+                      ccd_bar, nworkers,
+                      CcdCompressionProtocol::COO1D,
+                      0
+                  );
+
+                  size_t ccd_nnz = *(volatile unsigned*)&ccd_inds[ccd_total_tiles];
+                  size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
+
+                  if (tid == 0) {
+                    CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
+                    hdr->payload_bytes = ccd_payload;
+                    hdr->nnz = ccd_nnz;
+                    hdr->bv_offset = 0; hdr->inds_offset = 0; hdr->vals_offset = 0;
+                    hdr->format = (size_t)CcdCompressionProtocol::COO1D;
                   }
-                }
 
-              } else {
-                // SPOP
-                const size_t ccd_num_inds = ccd_total_tiles + 1;
-                const size_t ccd_bv_bytes    = ccd_total_tiles * 64 * sizeof(uint64_t);
-                const size_t ccd_bv_padded   = ccd_pad16(ccd_bv_bytes);
-                const size_t ccd_inds_bytes  = ccd_num_inds * sizeof(unsigned);
-                const size_t ccd_inds_padded = ccd_pad16(ccd_inds_bytes);
-                const size_t ccd_vals_offset = ccd_bv_padded + ccd_inds_padded;
+                  if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
+                    ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                    if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
+                    connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
+                  }
 
-                uint64_t* ccd_bv   = (uint64_t*)ccd_send_after_hdr;
-                unsigned* ccd_inds = (unsigned*)(ccd_send_after_hdr + ccd_bv_padded);
-                T* ccd_vals        = (T*)(ccd_send_after_hdr + ccd_vals_offset);
+                  if (slice == 0) {
+                    float actual_density = (float)ccd_nnz / (float)workSize;
+                    if (!Recv) {
+                      ccdBaseDensity = actual_density;
+                      ccdTrackedDensity = actual_density;
+                    } else {
+                      ccdTrackedDensity = ccd_expected_density(actual_density, ccdBaseDensity);
+                    }
+                  }
 
-                ccd_fused_single_block_spop_compress<T, unsigned>(
-                    ccd_dense_buf, ccd_vals,
-                    ccd_N, ccd_M,
-                    ccd_bv, ccd_inds,
-                    0, nworkers / warpSize - 1,
-                    ccd_bar, nworkers
-                );
+                } else {
+                  // SPOP
+                  const size_t ccd_num_inds = ccd_total_tiles + 1;
+                  const size_t ccd_bv_bytes    = ccd_total_tiles * 64 * sizeof(uint64_t);
+                  const size_t ccd_bv_padded   = ccd_pad16(ccd_bv_bytes);
+                  const size_t ccd_inds_bytes  = ccd_num_inds * sizeof(unsigned);
+                  const size_t ccd_inds_padded = ccd_pad16(ccd_inds_bytes);
+                  const size_t ccd_vals_offset = ccd_bv_padded + ccd_inds_padded;
 
-                size_t ccd_nnz = ccd_inds[ccd_total_tiles];
-                size_t ccd_payload = ccd_vals_offset + ccd_nnz * sizeof(T);
+                  uint64_t* ccd_bv   = (uint64_t*)ccd_send_after_hdr;
+                  unsigned* ccd_inds = (unsigned*)(ccd_send_after_hdr + ccd_bv_padded);
+                  T* ccd_vals        = (T*)(ccd_send_after_hdr + ccd_vals_offset);
 
-                if (tid == 0) {
-                  CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
-                  hdr->payload_bytes = ccd_payload;
-                  hdr->nnz = ccd_nnz;
-                  hdr->bv_offset = 0;
-                  hdr->inds_offset = ccd_bv_padded;
-                  hdr->vals_offset = ccd_vals_offset;
-                  hdr->format = (size_t)CcdCompressionProtocol::SPOP;
-                }
+                  ccd_fused_single_block_spop_compress<T, unsigned>(
+                      ccd_dense_buf, ccd_vals,
+                      ccd_N, ccd_M,
+                      ccd_bv, ccd_inds,
+                      0, nworkers / warpSize - 1,
+                      ccd_bar, nworkers
+                  );
 
-                if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                  ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
-                  if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
-                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
-                }
+                  size_t ccd_nnz = ccd_inds[ccd_total_tiles];
+                  size_t ccd_payload = ccd_vals_offset + ccd_nnz * sizeof(T);
 
-                if (slice == 0) {
-                  float actual_density = (float)ccd_nnz / (float)workSize;
-                  if (!Recv) {
-                    ccdBaseDensity = actual_density;
-                    ccdTrackedDensity = actual_density;
-                  } else {
-                    ccdTrackedDensity = ccd_expected_density(actual_density, ccdBaseDensity);
+                  if (tid == 0) {
+                    CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
+                    hdr->payload_bytes = ccd_payload;
+                    hdr->nnz = ccd_nnz;
+                    hdr->bv_offset = 0;
+                    hdr->inds_offset = ccd_bv_padded;
+                    hdr->vals_offset = ccd_vals_offset;
+                    hdr->format = (size_t)CcdCompressionProtocol::SPOP;
+                  }
+
+                  if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
+                    ssize_t ccd_send_size = sizeof(CcdSparseChunkHeader) + ccd_payload;
+                    if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
+                    connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
+                  }
+
+                  if (slice == 0) {
+                    float actual_density = (float)ccd_nnz / (float)workSize;
+                    if (!Recv) {
+                      ccdBaseDensity = actual_density;
+                      ccdTrackedDensity = actual_density;
+                    } else {
+                      ccdTrackedDensity = ccd_expected_density(actual_density, ccdBaseDensity);
+                    }
                   }
                 }
               }
-            }
 
-            // ---- Copy to output: sendbuff → recvbuff ----
-            // RS final (Recv=1 Send=0 Dst=1), AG step 0 copySend (!Recv Dst=1),
-            // or AR transition (Recv=1 Send=1 Dst=1)
-            if (Dst) {
-              if (!Send) {
-                // RS final step or AG step 0 without send: barrier for scatter-add
-                int ccd_bar_cp = 15 - group - (nworkers != nthreads ? 1 : 0);
-                barrier_sync(ccd_bar_cp, nworkers);
-              }
-              // When Send is set (AR transition), scatter-add and compress are done
-              // with their own barriers above. Compress writes to send FIFO (not
-              // sendbuff), so no conflict reading sendbuff here.
-              T* ccd_out = (T*)ncclShmem.groups[group].dsts[0];
-              for (int i = tid; i < workSize; i += nworkers) {
-                ccd_out[i] = ccd_dense_buf[i];
+              // Copy to output (RS final or AR transition with compressed send)
+              if (Dst) {
+                if (!Send) {
+                  int ccd_bar_cp = 15 - group - (nworkers != nthreads ? 1 : 0);
+                  barrier_sync(ccd_bar_cp, nworkers);
+                }
+                T* ccd_out = (T*)ncclShmem.groups[group].dsts[0];
+                for (int i = tid; i < workSize; i += nworkers) {
+                  ccd_out[i] = ccd_dense_buf[i];
+                }
               }
             }
 
           } else {
             // ============================================================
-            // AG MODE: Src=0 → no sendbuff, decompress to output + relay
-            // Format is determined by sender (in header), relay just forwards.
+            // AG MODE: Src=0 → decompress to output + relay
             // ============================================================
 
-            if (Recv) {
-              // ---- Decompress: recv FIFO → output (dsts[0], overwrite) ----
-              T* ccd_out = (T*)ncclShmem.groups[group].dsts[0]; // recvbuff at correct offset
-              char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[0]; // recv FIFO
-              CcdSparseChunkHeader* recv_hdr = (CcdSparseChunkHeader*)(ccd_recv_after_hdr - sizeof(CcdSparseChunkHeader));
-              CcdCompressionProtocol recv_format = (CcdCompressionProtocol)recv_hdr->format;
+            if (Recv && !recv_is_compressed) {
+              // ---- AG DENSE: fused reduceCopy for recv→output+send ----
+              if (Send) {
+                if (tid == 0) {
+                  CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(
+                      (char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
+                  hdr->payload_bytes = (size_t)workSize * sizeof(T);
+                  hdr->nnz = (size_t)workSize;
+                  hdr->bv_offset = 0; hdr->inds_offset = 0; hdr->vals_offset = 0;
+                  hdr->format = (size_t)CcdCompressionProtocol::DENSE;
+                }
+                if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
+                  ssize_t sz = sizeof(CcdSparseChunkHeader) + (ssize_t)workSize * (ssize_t)sizeof(T);
+                  if (sz < CCD_MIN_SEND_BYTES) sz = CCD_MIN_SEND_BYTES;
+                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = sz;
+                }
+              }
+              constexpr int PreOpSrcs2 = SrcBuf != Input ? 0 : 1;
+              reduceCopy<Unroll, RedOp, T,
+                  0, Recv+Src, Recv*MaxRecv+Src,
+                  0, Send+Dst, Send*MaxSend+Dst, PreOpSrcs2>
+                  (tid, nworkers, ncclShmem.redOpArgs[0], ncclShmem.redOpArgs, postOp,
+                   Recv*fan.nrecv()+Src, ncclShmem.groups[group].srcs,
+                   Send*fan.nsend()+Dst, ncclShmem.groups[group].dsts,
+                   workSize);
 
-              if (recv_format == CcdCompressionProtocol::DENSE) {
-                // Dense: memcpy recv → output
-                const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                for (int i = tid; i < workSize; i += nworkers) {
-                  ccd_out[i] = recv_vals[i];
-                }
-              } else if (recv_format == CcdCompressionProtocol::COO1D) {
-                // COO1D: zero output then scatter values
+            } else if (Recv) {
+              // ---- AG compressed: custom decompress + reduceCopy relay ----
+              T* ccd_out = (T*)ncclShmem.groups[group].dsts[0];
+              char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[0];
+
+              if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
                 for (int i = tid; i < workSize; i += nworkers) {
                   ccd_out[i] = (T)0;
                 }
                 int ccd_bar_z = 15 - group - (nworkers != nthreads ? 1 : 0);
                 barrier_sync(ccd_bar_z, nworkers);
                 const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + recv_hdr->nnz * sizeof(T));
+                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->nnz * sizeof(T));
                 ccd_coo1d_decompress_into<T, unsigned>(
-                    ccd_out, recv_vals, recv_keys, recv_hdr->nnz,
-                    0, nworkers / warpSize - 1
-                );
+                    ccd_out, recv_vals, recv_keys, ccd_recv_hdr->nnz,
+                    0, nworkers / warpSize - 1);
               } else {
-                // SPOP: zero output then decompress
+                // SPOP
                 for (int i = tid; i < workSize; i += nworkers) {
                   ccd_out[i] = (T)0;
                 }
                 int ccd_bar_z = 15 - group - (nworkers != nthreads ? 1 : 0);
                 barrier_sync(ccd_bar_z, nworkers);
-                const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + recv_hdr->bv_offset);
-                const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + recv_hdr->inds_offset);
-                const T* recv_vals        = (const T*)(ccd_recv_after_hdr + recv_hdr->vals_offset);
+                const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + ccd_recv_hdr->bv_offset);
+                const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->inds_offset);
+                const T* recv_vals        = (const T*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset);
                 ccd_decompress_or_scatter_into<T, unsigned>(
-                    ccd_out, recv_vals,
-                    ccd_N, ccd_M,
-                    recv_bv, recv_inds,
-                    0, nworkers / warpSize - 1,
-                    /*scatter_into=*/false
-                );
+                    ccd_out, recv_vals, ccd_N, ccd_M,
+                    recv_bv, recv_inds, 0, nworkers / warpSize - 1,
+                    /*scatter_into=*/false);
               }
 
-              // Barrier: finish decompress before relay reads recv FIFO
+              // Relay compressed data via reduceCopy
               if (Send) {
                 int ccd_bar_dr = 15 - group - (nworkers != nthreads ? 1 : 0);
                 barrier_sync(ccd_bar_dr, nworkers);
-              }
-            }
 
-            // ---- Relay: memcpy compressed data from recv FIFO -> send FIFO ----
-            if (Recv && Send) {
-              char* ccd_recv_start = (char*)ncclShmem.groups[group].srcs[0] - sizeof(CcdSparseChunkHeader);
-              char* ccd_send_start = (char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader);
-              CcdSparseChunkHeader* recv_hdr = (CcdSparseChunkHeader*)ccd_recv_start;
-              size_t relay_bytes = sizeof(CcdSparseChunkHeader) + recv_hdr->payload_bytes;
+                // Adjust pointers back to include header for relay
+                ncclShmem.groups[group].srcs[0] =
+                    (T*)((char*)ncclShmem.groups[group].srcs[0] - sizeof(CcdSparseChunkHeader));
+                ncclShmem.groups[group].dsts[Dst] =
+                    (T*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
 
-              // Worker-parallel memcpy (4-byte granularity)
-              size_t relay_words = (relay_bytes + 3) / 4;
-              for (size_t i = tid; i < relay_words; i += nworkers) {
-                ((unsigned*)ccd_send_start)[i] = ((unsigned*)ccd_recv_start)[i];
-              }
+                int relay_elems = (int)((sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes
+                                      + sizeof(T) - 1) / sizeof(T));
+                reduceCopy<Unroll, RedOp, T,
+                    0, 1, 1,
+                    0, 1, 1, 0>
+                    (tid, nworkers, 0, nullptr, false,
+                     1, ncclShmem.groups[group].srcs,
+                     1, ncclShmem.groups[group].dsts + Dst,
+                     relay_elems);
 
-              // Set connFifo.size to forwarded payload size
-              if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                ssize_t ccd_send_size = (ssize_t)relay_bytes;
-                if (ccd_send_size < CCD_MIN_SEND_BYTES) ccd_send_size = CCD_MIN_SEND_BYTES;
-                connFifo[(step - StepPerSlice) % NCCL_STEPS].size = ccd_send_size;
+                if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
+                  ssize_t sz = sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes;
+                  if (sz < CCD_MIN_SEND_BYTES) sz = CCD_MIN_SEND_BYTES;
+                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = sz;
+                }
               }
             }
           }
