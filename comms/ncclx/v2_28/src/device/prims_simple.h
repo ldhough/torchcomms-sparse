@@ -619,11 +619,16 @@ class Primitives<
                 int ccd_bar_dr = 15 - group - (nworkers != nthreads ? 1 : 0);
                 barrier_sync(ccd_bar_dr, nworkers);
 
-                // Adjust pointers back to include header for relay
-                ncclShmem.groups[group].srcs[0] =
-                    (T*)((char*)ncclShmem.groups[group].srcs[0] - sizeof(CcdSparseChunkHeader));
-                ncclShmem.groups[group].dsts[Dst] =
-                    (T*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
+                // Adjust pointers back to include header for relay (tid==0 only to avoid
+                // read-modify-write race on shared memory across warps)
+                if (tid == 0) {
+                  ncclShmem.groups[group].srcs[0] =
+                      (T*)((char*)ncclShmem.groups[group].srcs[0] - sizeof(CcdSparseChunkHeader));
+                  ncclShmem.groups[group].dsts[Dst] =
+                      (T*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
+                }
+                int ccd_bar_adj = 15 - group - (nworkers != nthreads ? 1 : 0);
+                barrier_sync(ccd_bar_adj, nworkers);
 
                 int relay_elems = (int)((sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes
                                       + sizeof(T) - 1) / sizeof(T));
