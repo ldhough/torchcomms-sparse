@@ -58,6 +58,7 @@ class Primitives<
   uint8_t ccdFormatMask;
   float ccdDenseThreshold;
   float ccdAgDenseThreshold;
+  float ccdDenseIntraThreshold;
   float ccdTrackedDensity;
   float ccdBaseDensity;
   CcdCompressionProtocol ccdStepProtocol;
@@ -281,11 +282,18 @@ class Primitives<
           // ---- Determine send format ----
           CcdCompressionProtocol ccd_send_fmt = CcdCompressionProtocol::DENSE;
           if (Send) {
-            float ccd_active_threshold = (Recv && Dst) ? ccdAgDenseThreshold : ccdDenseThreshold;
+            // Topology-aware threshold: use intra threshold for intra-node sends (RS only)
+            float ccd_rs_threshold = ccdDenseThreshold;
+            if (!(Recv && Dst)) {  // RS mode (not AG transition)
+              int sendPeer = ncclShmem.channel.ring.next;
+              bool sendIsIntraNode = (ncclShmem.comm.rankToNode[sendPeer] == ncclShmem.comm.node);
+              if (sendIsIntraNode) ccd_rs_threshold = ccdDenseIntraThreshold;
+            }
+            float ccd_active_threshold = (Recv && Dst) ? ccdAgDenseThreshold : ccd_rs_threshold;
             if (slice == 0) {
               if (!Recv) {
-                // Step 0: force SPOP for baseDensity capture
-                if (ccdFormatMask & CcdMaskSPOP) {
+                // Step 0: force SPOP for baseDensity capture (skip if threshold guarantees dense)
+                if (ccd_active_threshold < 1.0f && (ccdFormatMask & CcdMaskSPOP)) {
                   ccd_send_fmt = CcdCompressionProtocol::SPOP;
                 } else {
                   ccd_send_fmt = select_ccd_compression_protocol<T, unsigned>(
@@ -351,7 +359,7 @@ class Primitives<
 
               if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
                 const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->nnz * sizeof(T));
+                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * sizeof(T), sizeof(unsigned)));
                 ccd_coo1d_scatter_into<T, unsigned>(
                     ccd_dense_buf, recv_vals, recv_keys, ccd_recv_hdr->nnz,
                     0, nworkers / warpSize - 1);
@@ -413,7 +421,7 @@ class Primitives<
                       0, nworkers / warpSize - 1);
                 } else if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
                   const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                  const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->nnz * sizeof(T));
+                  const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * sizeof(T), sizeof(unsigned)));
                   ccd_coo1d_scatter_into<T, unsigned>(
                       ccd_dense_buf, recv_vals, recv_keys, ccd_recv_hdr->nnz,
                       0, nworkers / warpSize - 1);
@@ -455,12 +463,11 @@ class Primitives<
                       ccd_bv, ccd_inds,
                       0, nworkers / warpSize - 1,
                       ccd_bar, nworkers,
-                      CcdCompressionProtocol::COO1D,
-                      0
+                      CcdCompressionProtocol::COO1D
                   );
 
                   size_t ccd_nnz = *(volatile unsigned*)&ccd_inds[ccd_total_tiles];
-                  size_t ccd_payload = ccd_nnz * (sizeof(T) + sizeof(unsigned));
+                  size_t ccd_payload = ccd_align_up(ccd_nnz * sizeof(T), sizeof(unsigned)) + ccd_nnz * sizeof(unsigned);
 
                   if (tid == 0) {
                     CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -594,7 +601,7 @@ class Primitives<
                 int ccd_bar_z = 15 - group - (nworkers != nthreads ? 1 : 0);
                 barrier_sync(ccd_bar_z, nworkers);
                 const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->nnz * sizeof(T));
+                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * sizeof(T), sizeof(unsigned)));
                 ccd_coo1d_decompress_into<T, unsigned>(
                     ccd_out, recv_vals, recv_keys, ccd_recv_hdr->nnz,
                     0, nworkers / warpSize - 1);
@@ -1025,6 +1032,7 @@ private:
     ccdFormatMask = collWork ? collWork->ccdFormatMask : CcdMaskAll;
     ccdDenseThreshold = collWork ? collWork->ccdDenseThreshold : 0.3f;
     ccdAgDenseThreshold = collWork ? collWork->ccdAgDenseThreshold : 0.1f;
+    ccdDenseIntraThreshold = collWork ? collWork->ccdDenseIntraThreshold : 0.9f;
     ccdTrackedDensity = 0.0f;
     ccdBaseDensity = 0.0f;
     ccdStepProtocol = CcdCompressionProtocol::SPOP;

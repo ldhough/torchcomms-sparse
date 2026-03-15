@@ -309,6 +309,7 @@ struct alignas(16) ncclDevWorkColl {
   uint8_t ccdFormatMask;
   float ccdDenseThreshold;
   float ccdAgDenseThreshold;
+  float ccdDenseIntraThreshold;
 };
 
 
@@ -431,6 +432,7 @@ struct ncclKernelComm {
   // Channels, device side
   struct ncclDevChannel* channels/*[MAXCHANNELS]*/;
   int* rankToLocalRank;
+  int* rankToNode;
 
   // Profiler counters
   struct ncclDevProfiler* workStarted/*[MAXCHANNELS]*/;

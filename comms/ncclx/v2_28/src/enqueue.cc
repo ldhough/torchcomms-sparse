@@ -328,6 +328,7 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.ccdFormatMask = task->ccdFormatMask;
     devWork.ccdDenseThreshold = task->ccdDenseThreshold;
     devWork.ccdAgDenseThreshold = task->ccdAgDenseThreshold;
+    devWork.ccdDenseIntraThreshold = task->ccdDenseIntraThreshold;
     if (task->regBufType & NCCL_NET_REG_BUFFER)
       devWork.netRegUsed = 1;
     if (task->regBufType & (NCCL_IPC_REG_BUFFER | NCCL_NVLS_REG_BUFFER))
@@ -2561,6 +2562,7 @@ static ncclResult_t collTaskAppend(
   t->ccdFormatMask = info->ccdFormatMask;
   t->ccdDenseThreshold = info->ccdDenseThreshold;
   t->ccdAgDenseThreshold = info->ccdAgDenseThreshold;
+  t->ccdDenseIntraThreshold = info->ccdDenseIntraThreshold;
   t->eActivationMask = ncclProfilerApiState.eActivationMask;
   t->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   t->collApiEventHandle = ncclProfilerApiState.collApiEventHandle;

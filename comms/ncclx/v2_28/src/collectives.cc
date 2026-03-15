@@ -253,6 +253,8 @@ ncclResult_t ncclReduceScatterSparse(const void* sendbuff, void* recvbuff, size_
   info.ccdDenseThreshold = dthresh ? (float)atof(dthresh) : 0.3f;
   const char* agthresh = getenv("NCCL_CCD_AG_DENSE_THRESHOLD");
   info.ccdAgDenseThreshold = agthresh ? (float)atof(agthresh) : 0.1f;
+  const char* ithresh = getenv("NCCL_CCD_DENSE_INTRA_THRESHOLD");
+  info.ccdDenseIntraThreshold = ithresh ? (float)atof(ithresh) : 0.9f;
 
   return ncclEnqueueCheck(&info);
 }
@@ -274,6 +276,8 @@ ncclResult_t ncclAllGatherSparse(const void* sendbuff, void* recvbuff, size_t se
   const char* agthresh = getenv("NCCL_CCD_AG_DENSE_THRESHOLD");
   info.ccdDenseThreshold = agthresh ? (float)atof(agthresh) : 0.1f;
   info.ccdAgDenseThreshold = info.ccdDenseThreshold;
+  // AG doesn't use intra threshold (no format changes mid-relay), but plumb it anyway
+  info.ccdDenseIntraThreshold = 0.9f;
 
   return ncclEnqueueCheck(&info);
 }
@@ -294,6 +298,8 @@ ncclResult_t ncclAllReduceSparse(const void* sendbuff, void* recvbuff, size_t co
   info.ccdDenseThreshold = dthresh ? (float)atof(dthresh) : 0.3f;
   const char* agthresh = getenv("NCCL_CCD_AG_DENSE_THRESHOLD");
   info.ccdAgDenseThreshold = agthresh ? (float)atof(agthresh) : 0.1f;
+  const char* ithresh_ar = getenv("NCCL_CCD_DENSE_INTRA_THRESHOLD");
+  info.ccdDenseIntraThreshold = ithresh_ar ? (float)atof(ithresh_ar) : 0.9f;
 
   return ncclEnqueueCheck(&info);
 }

@@ -36,6 +36,7 @@ struct ncclInfo {
   uint8_t ccdFormatMask;
   float ccdDenseThreshold;
   float ccdAgDenseThreshold;
+  float ccdDenseIntraThreshold;
 };
 
 #endif

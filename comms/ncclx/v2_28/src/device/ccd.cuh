@@ -17,6 +17,12 @@ size_t ccd_pad16(size_t x) {
     return (x + 15) & ~(size_t) 15;
 }
 
+// Align x up to a multiple of 'align' (must be power of 2)
+__device__ __host__ __forceinline__
+size_t ccd_align_up(size_t x, size_t align) {
+    return (x + align - 1) & ~(align - 1);
+}
+
 __host__ __device__ __forceinline__
 size_t ceil_div(size_t a, size_t b) {
     return (a + b - 1) / b;
@@ -50,7 +56,7 @@ float ccd_expected_density(float d_prev, float d_base) {
 template<typename ValType = float, typename IndType = unsigned>
 __host__ __device__ __forceinline__
 size_t ccd_coo_overhead_bytes(size_t nnz) {
-    return nnz * (sizeof(ValType) + sizeof(IndType));
+    return ccd_align_up(nnz * sizeof(ValType), sizeof(IndType)) + nnz * sizeof(IndType);
 }
 
 template<typename ValType = float, typename IndType = unsigned>
@@ -108,8 +114,7 @@ void ccd_fused_single_block_spop_compress(
     const unsigned warp_end_idx,
     const int bar,
     const int nworkers_count,
-    CcdCompressionProtocol protocol = CcdCompressionProtocol::SPOP,
-    size_t key_padding_elems = 0
+    CcdCompressionProtocol protocol = CcdCompressionProtocol::SPOP
 ) {
     // thread/warp indexing
     const unsigned num_warps  = warp_end_idx + 1 - warp_start_idx;
@@ -222,6 +227,7 @@ void ccd_fused_single_block_spop_compress(
     */
     barrier_sync(bar, nworkers_count);
     const IndType nnz = inds[total_tiles];
+    unsigned* coo1d_keys = (unsigned*)((char*)compressed + ccd_align_up(nnz * sizeof(ValType), sizeof(unsigned)));
     const unsigned dlane = lane * 2;
     for (
         size_t tile_index = warp_idx;
@@ -273,7 +279,7 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_compressed_index = nz_count_0 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
                 if (protocol == CcdCompressionProtocol::COO1D) {
-                    ((unsigned*)(compressed + nnz + key_padding_elems))[full_compressed_index] = (unsigned)full_dense_index;
+                    coo1d_keys[full_compressed_index] = (unsigned)full_dense_index;
                 }
             }
         }
@@ -285,7 +291,7 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_compressed_index = nz_count_1 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
                 if (protocol == CcdCompressionProtocol::COO1D) {
-                    ((unsigned*)(compressed + nnz + key_padding_elems))[full_compressed_index] = (unsigned)full_dense_index;
+                    coo1d_keys[full_compressed_index] = (unsigned)full_dense_index;
                 }
             }
         }
