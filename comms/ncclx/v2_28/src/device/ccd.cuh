@@ -114,7 +114,8 @@ void ccd_fused_single_block_spop_compress(
     const unsigned warp_end_idx,
     const int bar,
     const int nworkers_count,
-    CcdCompressionProtocol protocol = CcdCompressionProtocol::SPOP
+    CcdCompressionProtocol protocol = CcdCompressionProtocol::SPOP,
+    const size_t flat_count = 0  // actual element count; 0 means N*M (no OOB possible)
 ) {
     // thread/warp indexing
     const unsigned num_warps  = warp_end_idx + 1 - warp_start_idx;
@@ -155,7 +156,7 @@ void ccd_fused_single_block_spop_compress(
         if (lane < cols_to_process) { // if there are < 32 cols, mask some threads
             for (size_t j = 0; j < rows_to_process; ++j) {
                 size_t full_idx = base_idx + (j * (size_t) M);
-                ValType val = dense[full_idx];
+                ValType val = (flat_count > 0 && full_idx >= flat_count) ? (ValType) 0 : dense[full_idx];
                 uint64_t is_nz = (float)val != 0.0f;
                 col_0_bv |= (is_nz << j);
                 nz_count_0 += (unsigned) is_nz;
@@ -170,7 +171,7 @@ void ccd_fused_single_block_spop_compress(
         if (lane + warpSize < cols_to_process) {
             for (size_t j = 0; j < rows_to_process; ++j) {
                 size_t full_idx = base_idx + (j * (size_t) M);
-                ValType val = dense[full_idx];
+                ValType val = (flat_count > 0 && full_idx >= flat_count) ? (ValType) 0 : dense[full_idx];
                 uint64_t is_nz = (float)val != 0.0f;
                 col_1_bv |= (is_nz << j);
                 nz_count_1 += (unsigned) is_nz;
@@ -227,7 +228,7 @@ void ccd_fused_single_block_spop_compress(
     */
     barrier_sync(bar, nworkers_count);
     const IndType nnz = inds[total_tiles];
-    unsigned* coo1d_keys = (unsigned*)((char*)compressed + ccd_align_up(nnz * sizeof(ValType), sizeof(unsigned)));
+    unsigned *coo1d_keys = (unsigned*) ((char*) compressed + ccd_align_up(nnz * sizeof(ValType), sizeof(unsigned)));
     const unsigned dlane = lane * 2;
     for (
         size_t tile_index = warp_idx;
@@ -279,7 +280,15 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_compressed_index = nz_count_0 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
                 if (protocol == CcdCompressionProtocol::COO1D) {
-                    coo1d_keys[full_compressed_index] = (unsigned)full_dense_index;
+                    // DEBUG: check key bounds
+                    size_t key_limit = flat_count > 0 ? flat_count : N * M;
+                    if (full_dense_index >= key_limit) {
+                      printf("CCD_BUG compress col0: key=%lu >= limit=%lu (tile=%lu lane=%u row=%u)\n",
+                             (unsigned long) full_dense_index, (unsigned long) key_limit,
+                             (unsigned long) tile_index, lane, set_lsb_idx);
+                      __trap();
+                    }
+                    coo1d_keys[full_compressed_index] = (unsigned) full_dense_index;
                 }
             }
         }
@@ -291,7 +300,15 @@ void ccd_fused_single_block_spop_compress(
                 const size_t full_compressed_index = nz_count_1 + idx;
                 compressed[full_compressed_index] = dense[full_dense_index];
                 if (protocol == CcdCompressionProtocol::COO1D) {
-                    coo1d_keys[full_compressed_index] = (unsigned)full_dense_index;
+                    // DEBUG: check key bounds
+                    size_t key_limit = flat_count > 0 ? flat_count : N * M;
+                    if (full_dense_index >= key_limit) {
+                      printf("CCD_BUG compress col1: key=%lu >= limit=%lu (tile=%lu lane=%u row=%u)\n",
+                             (unsigned long) full_dense_index, (unsigned long) key_limit,
+                             (unsigned long) tile_index, lane, set_lsb_idx);
+                      __trap();
+                    }
+                    coo1d_keys[full_compressed_index] = (unsigned) full_dense_index;
                 }
             }
         }
@@ -384,7 +401,7 @@ void ccd_decompress_or_scatter_into(
                 size_t full_dense_index = base_idx + (set_lsb_idx * M);
                 size_t full_compressed_index = nz_count_0 + idx;
                 if (scatter_into) {
-                    dense[full_dense_index] = (ValType)((float)dense[full_dense_index] + (float)compressed[full_compressed_index]);
+                    dense[full_dense_index] = (ValType)((float) dense[full_dense_index] + (float) compressed[full_compressed_index]);
                 } else {
                     dense[full_dense_index] = compressed[full_compressed_index];
                 }
@@ -397,7 +414,7 @@ void ccd_decompress_or_scatter_into(
                 size_t full_dense_index = base_idx + 1 + (set_lsb_idx * M);
                 size_t full_compressed_index = nz_count_1 + idx;
                 if (scatter_into) {
-                    dense[full_dense_index] = (ValType)((float)dense[full_dense_index] + (float)compressed[full_compressed_index]);
+                    dense[full_dense_index] = (ValType)((float) dense[full_dense_index] + (float) compressed[full_compressed_index]);
                 } else {
                     dense[full_dense_index] = compressed[full_compressed_index];
                 }
@@ -423,7 +440,7 @@ void ccd_coo1d_scatter_into(
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < nnz; i += nthreads) {
-        dense[keys[i]] = (ValType)((float)dense[keys[i]] + (float)vals[i]);
+        dense[keys[i]] = (ValType) ((float) dense[keys[i]] + (float) vals[i]);
     }
 }
 
@@ -444,6 +461,12 @@ void ccd_coo1d_decompress_into(
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < nnz; i += nthreads) {
+        // DEBUG: decompress key bounds check (max workSize = stepSize*StepPerSlice = ~1M)
+        if (keys[i] >= 1048576) {
+          printf("CCD_BUG decompress_into: keys[%lu]=%u OOB (nnz=%lu)\n",
+                 (unsigned long) i, keys[i], (unsigned long) nnz);
+          __trap();
+        }
         dense[keys[i]] = vals[i];
     }
 }
@@ -464,7 +487,7 @@ void ccd_dense_scatter_into(
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < n; i += nthreads) {
-        dst[i] = (T)((float)dst[i] + (float)src[i]);
+        dst[i] = (T)((float) dst[i] + (float) src[i]);
     }
 }
 

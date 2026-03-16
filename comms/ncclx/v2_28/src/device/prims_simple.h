@@ -267,7 +267,7 @@ class Primitives<
 
           // Virtual 2D shape for SPOP 64×64 tiling (column of tiles).
           const size_t ccd_M = 64;
-          const size_t ccd_N = (size_t)workSize / 64;
+          const size_t ccd_N = ((size_t)workSize + ccd_M - 1) / ccd_M;
           const size_t ccd_total_tiles = ceil_div(ccd_N, (size_t)64);
 
           // ---- Determine recv format ----
@@ -463,11 +463,35 @@ class Primitives<
                       ccd_bv, ccd_inds,
                       0, nworkers / warpSize - 1,
                       ccd_bar, nworkers,
-                      CcdCompressionProtocol::COO1D
+                      CcdCompressionProtocol::COO1D,
+                      (size_t)workSize
                   );
 
                   size_t ccd_nnz = *(volatile unsigned*)&ccd_inds[ccd_total_tiles];
                   size_t ccd_payload = ccd_align_up(ccd_nnz * sizeof(T), sizeof(unsigned)) + ccd_nnz * sizeof(unsigned);
+
+                  // DEBUG: bounds check after COO1D compress
+                  if (tid == 0) {
+                    size_t slot_cap = slot_bytes - sizeof(CcdSparseChunkHeader);
+                    char* scratch_start = (char*)ccd_bv;
+                    char* payload_end = ccd_send_after_hdr + ccd_payload;
+                    if (ccd_nnz > (size_t)workSize) {
+                      printf("CCD_BUG[rank=%d ch=%d] COO1D compress nnz=%lu > workSize=%d\n",
+                             ncclShmem.comm.rank, (int)ncclShmem.channelId, (unsigned long)ccd_nnz, workSize);
+                      __trap();
+                    }
+                    if (ccd_payload > slot_cap) {
+                      printf("CCD_BUG[rank=%d ch=%d] COO1D payload=%lu > slot_cap=%lu\n",
+                             ncclShmem.comm.rank, (int)ncclShmem.channelId, (unsigned long)ccd_payload, (unsigned long)slot_cap);
+                      __trap();
+                    }
+                    if (payload_end > scratch_start) {
+                      printf("CCD_BUG[rank=%d ch=%d] COO1D payload_end overlaps scratch! payload=%lu scratch_off=%lu\n",
+                             ncclShmem.comm.rank, (int)ncclShmem.channelId,
+                             (unsigned long)ccd_payload, (unsigned long)(scratch_start - (char*)slot_base));
+                      __trap();
+                    }
+                  }
 
                   if (tid == 0) {
                     CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -511,7 +535,9 @@ class Primitives<
                       ccd_N, ccd_M,
                       ccd_bv, ccd_inds,
                       0, nworkers / warpSize - 1,
-                      ccd_bar, nworkers
+                      ccd_bar, nworkers,
+                      CcdCompressionProtocol::SPOP,
+                      (size_t)workSize
                   );
 
                   size_t ccd_nnz = ccd_inds[ccd_total_tiles];
@@ -595,6 +621,30 @@ class Primitives<
               char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[0];
 
               if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
+                // DEBUG: bounds check before COO1D decompress (AG mode)
+                if (tid == 0) {
+                  size_t recv_nnz = ccd_recv_hdr->nnz;
+                  size_t recv_fmt = ccd_recv_hdr->format;
+                  size_t recv_payload = ccd_recv_hdr->payload_bytes;
+                  if (recv_nnz > (size_t)workSize) {
+                    printf("CCD_BUG[rank=%d ch=%d] AG decompress COO1D recv nnz=%lu > workSize=%d\n",
+                           ncclShmem.comm.rank, (int)ncclShmem.channelId, (unsigned long)recv_nnz, workSize);
+                    __trap();
+                  }
+                  if (recv_fmt != (size_t)CcdCompressionProtocol::COO1D) {
+                    printf("CCD_BUG[rank=%d ch=%d] AG decompress format mismatch! hdr says %lu but branch is COO1D\n",
+                           ncclShmem.comm.rank, (int)ncclShmem.channelId, (unsigned long)recv_fmt);
+                    __trap();
+                  }
+                  size_t expected_payload = ccd_align_up(recv_nnz * sizeof(T), sizeof(unsigned)) + recv_nnz * sizeof(unsigned);
+                  if (recv_payload != expected_payload) {
+                    printf("CCD_BUG[rank=%d ch=%d] AG COO1D payload mismatch: hdr=%lu expected=%lu nnz=%lu\n",
+                           ncclShmem.comm.rank, (int)ncclShmem.channelId,
+                           (unsigned long)recv_payload, (unsigned long)expected_payload, (unsigned long)recv_nnz);
+                    __trap();
+                  }
+                }
+
                 for (int i = tid; i < workSize; i += nworkers) {
                   ccd_out[i] = (T)0;
                 }
