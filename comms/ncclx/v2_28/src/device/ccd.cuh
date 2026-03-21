@@ -435,11 +435,11 @@ void ccd_coo1d_scatter_into(
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < nnz; i += nthreads) {
-        if (keys[i] >= dense_size) {
-            printf("COO1D SCATTER OOB: blk=%d tid=%d key[%lu]=%u >= dense_size=%lu nnz=%lu\n",
-                   blockIdx.x, threadIdx.x, i, (unsigned)keys[i], dense_size, nnz);
-            continue;
-        }
+        //if (keys[i] >= dense_size) {
+        //    printf("COO1D SCATTER OOB: blk=%d tid=%d key[%lu]=%u >= dense_size=%lu nnz=%lu\n",
+        //           blockIdx.x, threadIdx.x, i, (unsigned)keys[i], dense_size, nnz);
+        //    continue;
+        //}
         dense[keys[i]] = (ValType) ((float) dense[keys[i]] + (float) vals[i]);
     }
 }
@@ -462,11 +462,11 @@ void ccd_coo1d_decompress_into(
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < nnz; i += nthreads) {
-        if (keys[i] >= dense_size) {
-            printf("COO1D DECOMP OOB: blk=%d tid=%d key[%lu]=%u >= dense_size=%lu nnz=%lu\n",
-                   blockIdx.x, threadIdx.x, i, (unsigned)keys[i], dense_size, nnz);
-            continue;
-        }
+        //if (keys[i] >= dense_size) {
+        //    printf("COO1D DECOMP OOB: blk=%d tid=%d key[%lu]=%u >= dense_size=%lu nnz=%lu\n",
+        //           blockIdx.x, threadIdx.x, i, (unsigned)keys[i], dense_size, nnz);
+        //    continue;
+        //}
         dense[keys[i]] = vals[i];
     }
 }

@@ -707,15 +707,15 @@ static ncclResult_t scheduleCollTasksToPlan(
       }
       devWork->direct = directFlags;
 
-      if (task->isSparse) {
-        fprintf(stderr, "CCD CBD: chLo=%d chHi=%d cntLo=%zu cntMid=%zu cntHi=%zu nMidCh=%d grLo=%lu grMid=%lu grHi=%lu grainSz=%zu eltSz=%zu\n",
-                devWork->channelLo, devWork->channelHi,
-                countLo, countMid, countHi, nMidChannels,
-                (unsigned long)devWork->cbd.chunkGrainsLo,
-                (unsigned long)devWork->cbd.chunkGrainsMid,
-                (unsigned long)devWork->cbd.chunkGrainsHi,
-                grainSize, elementSize);
-      }
+      //if (task->isSparse) {
+      //  fprintf(stderr, "CCD CBD: chLo=%d chHi=%d cntLo=%zu cntMid=%zu cntHi=%zu nMidCh=%d grLo=%lu grMid=%lu grHi=%lu grainSz=%zu eltSz=%zu\n",
+      //          devWork->channelLo, devWork->channelHi,
+      //          countLo, countMid, countHi, nMidChannels,
+      //          (unsigned long)devWork->cbd.chunkGrainsLo,
+      //          (unsigned long)devWork->cbd.chunkGrainsMid,
+      //          (unsigned long)devWork->cbd.chunkGrainsHi,
+      //          grainSize, elementSize);
+      //}
 
       // Update the current channel and vacant traffic budget.
       if (countHi != 0) {
@@ -2100,8 +2100,8 @@ static ncclResult_t calcCollChunking(
   if (info->isSparse) {
     int defaultStepSize = (1 << 22) / NCCL_STEPS; // 512 KiB (dense default)
     int denseChunkSize = defaultStepSize * chunkSteps;
-    fprintf(stderr, "CCD CLAMP: isSparse=%d stepSize=%d chunkSteps=%d chunkSize=%d->%d denseChunkSize=%d nCh=%d nBytes=%zu\n",
-            info->isSparse, stepSize, chunkSteps, chunkSize, std::min(chunkSize, denseChunkSize), denseChunkSize, nChannels, nBytes);
+    //fprintf(stderr, "CCD CLAMP: isSparse=%d stepSize=%d chunkSteps=%d chunkSize=%d->%d denseChunkSize=%d nCh=%d nBytes=%zu\n",
+    //        info->isSparse, stepSize, chunkSteps, chunkSize, std::min(chunkSize, denseChunkSize), denseChunkSize, nChannels, nBytes);
     if (chunkSize > denseChunkSize) chunkSize = denseChunkSize;
   }
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;

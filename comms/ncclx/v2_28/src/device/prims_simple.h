@@ -278,12 +278,12 @@ class Primitives<
             char* ccd_ra = (char*)ncclShmem.groups[group].srcs[Src ? Src : 0];
             ccd_recv_hdr = (CcdSparseChunkHeader*)(ccd_ra - sizeof(CcdSparseChunkHeader));
             ccd_recv_fmt = (CcdCompressionProtocol)ccd_recv_hdr->format;
-            if (tid == 0 && ccd_recv_fmt != CcdCompressionProtocol::DENSE
-                && ccd_recv_hdr->nnz > (size_t)realWorkSize) {
-              printf("CCD HDR CORRUPT: blk=%d nnz=%lu > realWorkSize=%d fmt=%lu payload_bytes=%lu\n",
-                     blockIdx.x, ccd_recv_hdr->nnz, realWorkSize,
-                     ccd_recv_hdr->format, ccd_recv_hdr->payload_bytes);
-            }
+            //if (tid == 0 && ccd_recv_fmt != CcdCompressionProtocol::DENSE
+            //    && ccd_recv_hdr->nnz > (size_t)realWorkSize) {
+            //  printf("CCD HDR CORRUPT: blk=%d nnz=%lu > realWorkSize=%d fmt=%lu payload_bytes=%lu\n",
+            //         blockIdx.x, ccd_recv_hdr->nnz, realWorkSize,
+            //         ccd_recv_hdr->format, ccd_recv_hdr->payload_bytes);
+            //}
           }
 
           // ---- Determine send format ----
@@ -319,6 +319,13 @@ class Primitives<
 
           bool recv_is_compressed = Recv && (ccd_recv_fmt != CcdCompressionProtocol::DENSE);
           bool send_is_compressed = Send && (ccd_send_fmt != CcdCompressionProtocol::DENSE);
+
+          // Local buffer staging: when receiving compressed data over NVLink
+          // (P2P read mode), bulk-copy to local send FIFO first, then
+          // decompress/scatter-add from local memory instead of scattered
+          // NVLink reads.  NET recv and P2P write recv are already local.
+          bool shouldStage = recv_is_compressed
+              && (ncclShmem.groups[group].recvConns[0]->flags & NCCL_P2P_READ);
 
           if (Src) {
             // ============================================================
@@ -363,6 +370,38 @@ class Primitives<
               // Custom scatter-add, then reduceCopy for send (+output)
               T* ccd_dense_buf = (T*)ncclShmem.groups[group].srcs[0];
               char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[Src];
+
+              // Stage: bulk-copy compressed recv data to local send FIFO
+              if (shouldStage) {
+                if (!Send) {
+                  // Send=0 (RS final step): RoleWaitSend thread computes
+                  // staging pointer from its send step (stale but valid —
+                  // holds value from last Send=1 genericOp) and polls send
+                  // head (local memory) to ensure slot is free.
+                  if (flags & RoleWaitSend) {
+                    while (connStepCache + NCCL_STEPS < step + StepPerSlice) {
+                      connStepCache = loadStepValue(connStepPtr);
+                    }
+                    ncclShmem.groups[group].dsts[Dst] =
+                        connEltsFifo + (step % NCCL_STEPS) * connStepSize
+                        + sizeof(CcdSparseChunkHeader) / sizeof(T);
+                  }
+                  int ccd_bar_ptr = 15 - group - (nworkers != nthreads ? 1 : 0);
+                  barrier_sync(ccd_bar_ptr, nworkers);
+                }
+                char* stg = (char*)ncclShmem.groups[group].dsts[Dst];
+                CcdSparseChunkHeader* stg_hdr = (CcdSparseChunkHeader*)(stg - sizeof(CcdSparseChunkHeader));
+                if (tid == 0) *stg_hdr = *ccd_recv_hdr;
+                int ccd_bar_stg = 15 - group - (nworkers != nthreads ? 1 : 0);
+                barrier_sync(ccd_bar_stg, nworkers);
+                int stg_n4 = (stg_hdr->payload_bytes + 15) / 16;
+                const int4* stg_src = (const int4*)ccd_recv_after_hdr;
+                int4* stg_dst = (int4*)stg;
+                for (int i = tid; i < stg_n4; i += nworkers) stg_dst[i] = stg_src[i];
+                barrier_sync(ccd_bar_stg, nworkers);
+                ccd_recv_after_hdr = stg;
+                ccd_recv_hdr = stg_hdr;
+              }
 
               if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
                 const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * (size_t)ccdEltSize, sizeof(unsigned)));
@@ -419,6 +458,23 @@ class Primitives<
               // Scatter-add (if Recv)
               if (Recv) {
                 char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[Src];
+
+                // Stage: bulk-copy compressed recv data to local send FIFO
+                // (Send is always 1 in CASE 3/4, so dsts[Dst] is the send FIFO)
+                if (shouldStage) {
+                  char* stg = (char*)ncclShmem.groups[group].dsts[Dst];
+                  CcdSparseChunkHeader* stg_hdr = (CcdSparseChunkHeader*)(stg - sizeof(CcdSparseChunkHeader));
+                  if (tid == 0) *stg_hdr = *ccd_recv_hdr;
+                  int ccd_bar_stg = 15 - group - (nworkers != nthreads ? 1 : 0);
+                  barrier_sync(ccd_bar_stg, nworkers);
+                  int stg_n4 = (stg_hdr->payload_bytes + 15) / 16;
+                  const int4* stg_src = (const int4*)ccd_recv_after_hdr;
+                  int4* stg_dst = (int4*)stg;
+                  for (int i = tid; i < stg_n4; i += nworkers) stg_dst[i] = stg_src[i];
+                  barrier_sync(ccd_bar_stg, nworkers);
+                  ccd_recv_after_hdr = stg;
+                  ccd_recv_hdr = stg_hdr;
+                }
 
                 if (ccd_recv_fmt == CcdCompressionProtocol::DENSE) {
                   ccd_dense_scatter_into<T>(
@@ -611,10 +667,44 @@ class Primitives<
                    workSize);
 
             } else if (Recv) {
-              // ---- AG compressed: custom decompress + reduceCopy relay ----
+              // ---- AG compressed: custom decompress + relay ----
               T* ccd_out = (T*)ncclShmem.groups[group].dsts[0];
               char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[0];
 
+              // Stage: bulk-copy compressed recv data to local send FIFO.
+              // Eliminates double NVLink read (decompress + relay) and
+              // converts scattered decompression reads to local HBM.
+              if (shouldStage) {
+                if (!Send) {
+                  // Send=0 (AG final step): RoleWaitSend thread computes
+                  // staging pointer from its send step (stale but valid)
+                  // and polls send head (local memory) for slot availability.
+                  if (flags & RoleWaitSend) {
+                    while (connStepCache + NCCL_STEPS < step + StepPerSlice) {
+                      connStepCache = loadStepValue(connStepPtr);
+                    }
+                    ncclShmem.groups[group].dsts[Dst] =
+                        connEltsFifo + (step % NCCL_STEPS) * connStepSize
+                        + sizeof(CcdSparseChunkHeader) / sizeof(T);
+                  }
+                  int ccd_bar_ptr = 15 - group - (nworkers != nthreads ? 1 : 0);
+                  barrier_sync(ccd_bar_ptr, nworkers);
+                }
+                char* stg = (char*)ncclShmem.groups[group].dsts[Dst];
+                CcdSparseChunkHeader* stg_hdr = (CcdSparseChunkHeader*)(stg - sizeof(CcdSparseChunkHeader));
+                if (tid == 0) *stg_hdr = *ccd_recv_hdr;
+                int ccd_bar_stg = 15 - group - (nworkers != nthreads ? 1 : 0);
+                barrier_sync(ccd_bar_stg, nworkers);
+                int stg_n4 = (stg_hdr->payload_bytes + 15) / 16;
+                const int4* stg_src = (const int4*)ccd_recv_after_hdr;
+                int4* stg_dst = (int4*)stg;
+                for (int i = tid; i < stg_n4; i += nworkers) stg_dst[i] = stg_src[i];
+                barrier_sync(ccd_bar_stg, nworkers);
+                ccd_recv_after_hdr = stg;
+                ccd_recv_hdr = stg_hdr;
+              }
+
+              // Zero output + decompress (from local staging if staged, else remote FIFO)
               if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
                 for (int i = tid; i < workSize; i += nworkers) {
                   ccd_out[i] = (T)0;
@@ -640,36 +730,46 @@ class Primitives<
                     /*scatter_into=*/false);
               }
 
-              // Relay compressed data via reduceCopy
+              // Relay compressed data to send FIFO
               if (Send) {
-                int ccd_bar_dr = 15 - group - (nworkers != nthreads ? 1 : 0);
-                barrier_sync(ccd_bar_dr, nworkers);
+                if (shouldStage) {
+                  // Relay is free: data already in send FIFO from staging bulk copy.
+                  // Just write connFifo.size so proxy/downstream knows the payload size.
+                  if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
+                    ssize_t sz = sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes;
+                    if (sz < CCD_MIN_SEND_BYTES) sz = CCD_MIN_SEND_BYTES;
+                    connFifo[(step - StepPerSlice) % NCCL_STEPS].size = sz;
+                  }
+                } else {
+                  // Non-staged relay (NET recv or P2P write — data already local,
+                  // but still needs copying from recv FIFO to send FIFO)
+                  int ccd_bar_dr = 15 - group - (nworkers != nthreads ? 1 : 0);
+                  barrier_sync(ccd_bar_dr, nworkers);
 
-                // Adjust pointers back to include header for relay (tid==0 only to avoid
-                // read-modify-write race on shared memory across warps)
-                if (tid == 0) {
-                  ncclShmem.groups[group].srcs[0] =
-                      (T*)((char*)ncclShmem.groups[group].srcs[0] - sizeof(CcdSparseChunkHeader));
-                  ncclShmem.groups[group].dsts[Dst] =
-                      (T*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
-                }
-                int ccd_bar_adj = 15 - group - (nworkers != nthreads ? 1 : 0);
-                barrier_sync(ccd_bar_adj, nworkers);
+                  if (tid == 0) {
+                    ncclShmem.groups[group].srcs[0] =
+                        (T*)((char*)ncclShmem.groups[group].srcs[0] - sizeof(CcdSparseChunkHeader));
+                    ncclShmem.groups[group].dsts[Dst] =
+                        (T*)((char*)ncclShmem.groups[group].dsts[Dst] - sizeof(CcdSparseChunkHeader));
+                  }
+                  int ccd_bar_adj = 15 - group - (nworkers != nthreads ? 1 : 0);
+                  barrier_sync(ccd_bar_adj, nworkers);
 
-                int relay_elems = (int)((sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes
-                                      + sizeof(T) - 1) / sizeof(T));
-                reduceCopy<Unroll, RedOp, T,
-                    0, 1, 1,
-                    0, 1, 1, 0>
-                    (tid, nworkers, 0, nullptr, false,
-                     1, ncclShmem.groups[group].srcs,
-                     1, ncclShmem.groups[group].dsts + Dst,
-                     relay_elems);
+                  int relay_elems = (int)((sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes
+                                        + sizeof(T) - 1) / sizeof(T));
+                  reduceCopy<Unroll, RedOp, T,
+                      0, 1, 1,
+                      0, 1, 1, 0>
+                      (tid, nworkers, 0, nullptr, false,
+                       1, ncclShmem.groups[group].srcs,
+                       1, ncclShmem.groups[group].dsts + Dst,
+                       relay_elems);
 
-                if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
-                  ssize_t sz = sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes;
-                  if (sz < CCD_MIN_SEND_BYTES) sz = CCD_MIN_SEND_BYTES;
-                  connFifo[(step - StepPerSlice) % NCCL_STEPS].size = sz;
+                  if ((flags & RoleWaitSend) && (flags & ConnFifoEnabled)) {
+                    ssize_t sz = sizeof(CcdSparseChunkHeader) + ccd_recv_hdr->payload_bytes;
+                    if (sz < CCD_MIN_SEND_BYTES) sz = CCD_MIN_SEND_BYTES;
+                    connFifo[(step - StepPerSlice) % NCCL_STEPS].size = sz;
+                  }
                 }
               }
             }
