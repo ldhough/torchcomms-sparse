@@ -425,6 +425,7 @@ void ccd_coo1d_scatter_into(
     const ValType * __restrict__ vals,
     const IndType * __restrict__ keys,
     const size_t nnz,
+    const size_t dense_size,
     const unsigned warp_start_idx,
     const unsigned warp_end_idx
 ) {
@@ -434,6 +435,11 @@ void ccd_coo1d_scatter_into(
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < nnz; i += nthreads) {
+        if (keys[i] >= dense_size) {
+            printf("COO1D SCATTER OOB: blk=%d tid=%d key[%lu]=%u >= dense_size=%lu nnz=%lu\n",
+                   blockIdx.x, threadIdx.x, i, (unsigned)keys[i], dense_size, nnz);
+            continue;
+        }
         dense[keys[i]] = (ValType) ((float) dense[keys[i]] + (float) vals[i]);
     }
 }
@@ -446,6 +452,7 @@ void ccd_coo1d_decompress_into(
     const ValType * __restrict__ vals,
     const IndType * __restrict__ keys,
     const size_t nnz,
+    const size_t dense_size,
     const unsigned warp_start_idx,
     const unsigned warp_end_idx
 ) {
@@ -455,6 +462,11 @@ void ccd_coo1d_decompress_into(
     const unsigned tid_local = (warp_idx - warp_start_idx) * warpSize + lane;
     const unsigned nthreads = num_warps * warpSize;
     for (size_t i = tid_local; i < nnz; i += nthreads) {
+        if (keys[i] >= dense_size) {
+            printf("COO1D DECOMP OOB: blk=%d tid=%d key[%lu]=%u >= dense_size=%lu nnz=%lu\n",
+                   blockIdx.x, threadIdx.x, i, (unsigned)keys[i], dense_size, nnz);
+            continue;
+        }
         dense[keys[i]] = vals[i];
     }
 }
@@ -477,6 +489,146 @@ void ccd_dense_scatter_into(
     for (size_t i = tid_local; i < n; i += nthreads) {
         dst[i] = (T)((float) dst[i] + (float) src[i]);
     }
+}
+
+// ============================================================
+// Element-type dispatch wrappers
+//
+// AllGather kernels run with T=int8_t (NCCL byte-level conversion),
+// but sparse compress/decompress must operate on the real value type.
+// These wrappers take the caller's T as a template parameter:
+//   - sizeof(T) > 1  ->  T is already correct (RS/AR), compile-time direct call
+//   - sizeof(T) == 1 ->  AG path, runtime dispatch on ccdEltSize
+// ============================================================
+
+#define CCD_DISPATCH_BODY(eltSz, ...) \
+  do { \
+    if ((eltSz) == 4)      { typedef float   _CcdVT; __VA_ARGS__ } \
+    else if ((eltSz) == 2) { typedef __half   _CcdVT; __VA_ARGS__ } \
+    else if ((eltSz) == 8) { typedef double   _CcdVT; __VA_ARGS__ } \
+    else                    { typedef int8_t   _CcdVT; __VA_ARGS__ } \
+  } while(0)
+
+// Compress dispatch (wraps ccd_fused_single_block_spop_compress)
+template<typename T, typename IndType, bool CheckBounds>
+__device__ __forceinline__
+void ccd_compress_dispatch(
+    int eltSize, void* dense, void* vals,
+    size_t N, size_t M,
+    uint64_t* bv, IndType* inds,
+    unsigned warp_start, unsigned warp_end,
+    int bar, int nworkers,
+    CcdCompressionProtocol proto = CcdCompressionProtocol::SPOP,
+    size_t workSizeForBounds = 0
+) {
+  if constexpr (sizeof(T) > 1) {
+    if constexpr (CheckBounds) {
+      ccd_fused_single_block_spop_compress<T, IndType, true>(
+          (T*)dense, (T*)vals, N, M, bv, inds,
+          warp_start, warp_end, bar, nworkers, proto, workSizeForBounds);
+    } else {
+      ccd_fused_single_block_spop_compress<T, IndType, false>(
+          (T*)dense, (T*)vals, N, M, bv, inds,
+          warp_start, warp_end, bar, nworkers, proto);
+    }
+  } else {
+    CCD_DISPATCH_BODY(eltSize, {
+      if constexpr (CheckBounds) {
+        ccd_fused_single_block_spop_compress<_CcdVT, IndType, true>(
+            (_CcdVT*)dense, (_CcdVT*)vals, N, M, bv, inds,
+            warp_start, warp_end, bar, nworkers, proto, workSizeForBounds);
+      } else {
+        ccd_fused_single_block_spop_compress<_CcdVT, IndType, false>(
+            (_CcdVT*)dense, (_CcdVT*)vals, N, M, bv, inds,
+            warp_start, warp_end, bar, nworkers, proto);
+      }
+    });
+  }
+}
+
+// Decompress-or-scatter dispatch (wraps ccd_decompress_or_scatter_into)
+template<typename T>
+__device__ __forceinline__
+void ccd_spop_dispatch(
+    int eltSize, void* dense, const void* compressed,
+    size_t N, size_t M,
+    const uint64_t* bv, const unsigned* inds,
+    unsigned warp_start, unsigned warp_end,
+    bool scatter_into
+) {
+  if constexpr (sizeof(T) > 1) {
+    ccd_decompress_or_scatter_into<T, unsigned>(
+        (T*)dense, (const T*)compressed, N, M,
+        bv, inds, warp_start, warp_end, scatter_into);
+  } else {
+    CCD_DISPATCH_BODY(eltSize, {
+      ccd_decompress_or_scatter_into<_CcdVT, unsigned>(
+          (_CcdVT*)dense, (const _CcdVT*)compressed, N, M,
+          bv, inds, warp_start, warp_end, scatter_into);
+    });
+  }
+}
+
+// COO1D scatter-add dispatch
+template<typename T>
+__device__ __forceinline__
+void ccd_coo1d_scatter_dispatch(
+    int eltSize, void* dense, const void* vals_raw, const void* keys_raw,
+    size_t nnz, size_t dense_size,
+    unsigned warp_start, unsigned warp_end
+) {
+  if constexpr (sizeof(T) > 1) {
+    ccd_coo1d_scatter_into<T, unsigned>(
+        (T*)dense, (const T*)vals_raw, (const unsigned*)keys_raw,
+        nnz, dense_size, warp_start, warp_end);
+  } else {
+    CCD_DISPATCH_BODY(eltSize, {
+      ccd_coo1d_scatter_into<_CcdVT, unsigned>(
+          (_CcdVT*)dense, (const _CcdVT*)vals_raw, (const unsigned*)keys_raw,
+          nnz, dense_size, warp_start, warp_end);
+    });
+  }
+}
+
+// COO1D decompress (overwrite) dispatch
+template<typename T>
+__device__ __forceinline__
+void ccd_coo1d_decompress_dispatch(
+    int eltSize, void* dense, const void* vals_raw, const void* keys_raw,
+    size_t nnz, size_t dense_size,
+    unsigned warp_start, unsigned warp_end
+) {
+  if constexpr (sizeof(T) > 1) {
+    ccd_coo1d_decompress_into<T, unsigned>(
+        (T*)dense, (const T*)vals_raw, (const unsigned*)keys_raw,
+        nnz, dense_size, warp_start, warp_end);
+  } else {
+    CCD_DISPATCH_BODY(eltSize, {
+      ccd_coo1d_decompress_into<_CcdVT, unsigned>(
+          (_CcdVT*)dense, (const _CcdVT*)vals_raw, (const unsigned*)keys_raw,
+          nnz, dense_size, warp_start, warp_end);
+    });
+  }
+}
+
+// Format selection dispatch
+template<typename T>
+__device__ __forceinline__
+CcdCompressionProtocol ccd_select_format_dispatch(
+    int eltSize, size_t nnz, size_t dense_N, size_t allow_mask, float threshold
+) {
+  if constexpr (sizeof(T) > 1) {
+    return select_ccd_compression_protocol<T, unsigned>(nnz, dense_N, allow_mask, threshold);
+  } else {
+    if (eltSize == 4)
+      return select_ccd_compression_protocol<float, unsigned>(nnz, dense_N, allow_mask, threshold);
+    else if (eltSize == 2)
+      return select_ccd_compression_protocol<__half, unsigned>(nnz, dense_N, allow_mask, threshold);
+    else if (eltSize == 8)
+      return select_ccd_compression_protocol<double, unsigned>(nnz, dense_N, allow_mask, threshold);
+    else
+      return select_ccd_compression_protocol<int8_t, unsigned>(nnz, dense_N, allow_mask, threshold);
+  }
 }
 
 #endif /* NCCL_DEVICE_CCD_CUH */

@@ -56,6 +56,7 @@ class Primitives<
   uint64_t accSize;
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  uint8_t ccdEltSize;  // Original element size (e.g. 4 for float), may differ from sizeof(T) for AG
   float ccdDenseThreshold;
   float ccdAgDenseThreshold;
   float ccdDenseIntraThreshold;
@@ -258,16 +259,16 @@ class Primitives<
           // RS MODE (Src=1): scatter-add into sendbuff + compress + optional output copy
           // AG MODE (Src=0): decompress to output + relay
           //
-          // When both recv and send formats are DENSE, we use stock
-          // reduceCopy for fused vectorized operation. When send is
-          // compressed (SPOP/COO1D), we use custom compress kernels.
-          // When recv is compressed but send is DENSE, we custom
-          // scatter-add then reduceCopy for the send.
+          // AllGather kernels run with T=int8_t (NCCL byte conversion),
+          // but sparse ops must use the real element type. realWorkSize
+          // gives the element count in real-type units; dispatch wrappers
+          // select the correct template instantiation at runtime.
           // ============================================================
+          const int realWorkSize = (int)((size_t)workSize * sizeof(T) / (size_t)ccdEltSize);
 
           // Virtual 2D shape for SPOP 64×64 tiling (column of tiles).
           const size_t ccd_M = 64;
-          const size_t ccd_N = ((size_t)workSize + ccd_M - 1) / ccd_M;
+          const size_t ccd_N = ((size_t)realWorkSize + ccd_M - 1) / ccd_M;
           const size_t ccd_total_tiles = ceil_div(ccd_N, (size_t)64);
 
           // ---- Determine recv format ----
@@ -277,6 +278,12 @@ class Primitives<
             char* ccd_ra = (char*)ncclShmem.groups[group].srcs[Src ? Src : 0];
             ccd_recv_hdr = (CcdSparseChunkHeader*)(ccd_ra - sizeof(CcdSparseChunkHeader));
             ccd_recv_fmt = (CcdCompressionProtocol)ccd_recv_hdr->format;
+            if (tid == 0 && ccd_recv_fmt != CcdCompressionProtocol::DENSE
+                && ccd_recv_hdr->nnz > (size_t)realWorkSize) {
+              printf("CCD HDR CORRUPT: blk=%d nnz=%lu > realWorkSize=%d fmt=%lu payload_bytes=%lu\n",
+                     blockIdx.x, ccd_recv_hdr->nnz, realWorkSize,
+                     ccd_recv_hdr->format, ccd_recv_hdr->payload_bytes);
+            }
           }
 
           // ---- Determine send format ----
@@ -296,13 +303,13 @@ class Primitives<
                 if (ccd_active_threshold < 1.0f && (ccdFormatMask & CcdMaskSPOP)) {
                   ccd_send_fmt = CcdCompressionProtocol::SPOP;
                 } else {
-                  ccd_send_fmt = select_ccd_compression_protocol<T, unsigned>(
-                      (size_t)0, (size_t)workSize, ccdFormatMask, ccd_active_threshold);
+                  ccd_send_fmt = ccd_select_format_dispatch<T>(
+                      (int)ccdEltSize, (size_t)0, (size_t)realWorkSize, ccdFormatMask, ccd_active_threshold);
                 }
               } else {
-                size_t expected_nnz = (size_t)(ccdTrackedDensity * (float)workSize);
-                ccd_send_fmt = select_ccd_compression_protocol<T, unsigned>(
-                    expected_nnz, (size_t)workSize, ccdFormatMask, ccd_active_threshold);
+                size_t expected_nnz = (size_t)(ccdTrackedDensity * (float)realWorkSize);
+                ccd_send_fmt = ccd_select_format_dispatch<T>(
+                    (int)ccdEltSize, expected_nnz, (size_t)realWorkSize, ccdFormatMask, ccd_active_threshold);
               }
               ccdStepProtocol = ccd_send_fmt;
             } else {
@@ -358,18 +365,16 @@ class Primitives<
               char* ccd_recv_after_hdr = (char*)ncclShmem.groups[group].srcs[Src];
 
               if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
-                const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * sizeof(T), sizeof(unsigned)));
-                ccd_coo1d_scatter_into<T, unsigned>(
-                    ccd_dense_buf, recv_vals, recv_keys, ccd_recv_hdr->nnz,
-                    0, nworkers / warpSize - 1);
+                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * (size_t)ccdEltSize, sizeof(unsigned)));
+                ccd_coo1d_scatter_dispatch<T>(
+                    (int)ccdEltSize, ccd_dense_buf, ccd_recv_after_hdr, recv_keys,
+                    ccd_recv_hdr->nnz, (size_t)realWorkSize, 0, nworkers / warpSize - 1);
               } else { // SPOP
                 const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + ccd_recv_hdr->bv_offset);
                 const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->inds_offset);
-                const T* recv_vals        = (const T*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset);
-                ccd_decompress_or_scatter_into<T, unsigned>(
-                    ccd_dense_buf, recv_vals, ccd_N, ccd_M,
-                    recv_bv, recv_inds, 0, nworkers / warpSize - 1,
+                ccd_spop_dispatch<T>(
+                    (int)ccdEltSize, ccd_dense_buf, (const void*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset),
+                    ccd_N, ccd_M, recv_bv, recv_inds, 0, nworkers / warpSize - 1,
                     /*scatter_into=*/true);
               }
 
@@ -420,18 +425,16 @@ class Primitives<
                       ccd_dense_buf, (const T*)ccd_recv_after_hdr, (size_t)workSize,
                       0, nworkers / warpSize - 1);
                 } else if (ccd_recv_fmt == CcdCompressionProtocol::COO1D) {
-                  const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                  const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * sizeof(T), sizeof(unsigned)));
-                  ccd_coo1d_scatter_into<T, unsigned>(
-                      ccd_dense_buf, recv_vals, recv_keys, ccd_recv_hdr->nnz,
-                      0, nworkers / warpSize - 1);
+                  const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * (size_t)ccdEltSize, sizeof(unsigned)));
+                  ccd_coo1d_scatter_dispatch<T>(
+                      (int)ccdEltSize, ccd_dense_buf, ccd_recv_after_hdr, recv_keys,
+                      ccd_recv_hdr->nnz, (size_t)realWorkSize, 0, nworkers / warpSize - 1);
                 } else {
                   const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + ccd_recv_hdr->bv_offset);
                   const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->inds_offset);
-                  const T* recv_vals        = (const T*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset);
-                  ccd_decompress_or_scatter_into<T, unsigned>(
-                      ccd_dense_buf, recv_vals, ccd_N, ccd_M,
-                      recv_bv, recv_inds, 0, nworkers / warpSize - 1,
+                  ccd_spop_dispatch<T>(
+                      (int)ccdEltSize, ccd_dense_buf, (const void*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset),
+                      ccd_N, ccd_M, recv_bv, recv_inds, 0, nworkers / warpSize - 1,
                       /*scatter_into=*/true);
                 }
 
@@ -455,20 +458,19 @@ class Primitives<
                   char* slot_base = ccd_send_after_hdr - sizeof(CcdSparseChunkHeader);
                   unsigned* ccd_inds = (unsigned*)(slot_base + slot_bytes - ccd_pad16(ccd_inds_bytes));
                   uint64_t* ccd_bv = (uint64_t*)((char*)ccd_inds - ccd_pad16(ccd_bv_bytes));
-                  T* ccd_vals = (T*)ccd_send_after_hdr;
 
-                  if (workSize % ccd_M != 0) {
-                    ccd_fused_single_block_spop_compress<T, unsigned, true>(
-                        ccd_dense_buf, ccd_vals,
+                  if (realWorkSize % (int)ccd_M != 0) {
+                    ccd_compress_dispatch<T, unsigned, true>(
+                        (int)ccdEltSize, ccd_dense_buf, ccd_send_after_hdr,
                         ccd_N, ccd_M,
                         ccd_bv, ccd_inds,
                         0, nworkers / warpSize - 1,
                         ccd_bar, nworkers,
                         CcdCompressionProtocol::COO1D,
-                        (size_t)workSize);
+                        (size_t)realWorkSize);
                   } else {
-                    ccd_fused_single_block_spop_compress<T, unsigned, false>(
-                        ccd_dense_buf, ccd_vals,
+                    ccd_compress_dispatch<T, unsigned, false>(
+                        (int)ccdEltSize, ccd_dense_buf, ccd_send_after_hdr,
                         ccd_N, ccd_M,
                         ccd_bv, ccd_inds,
                         0, nworkers / warpSize - 1,
@@ -477,7 +479,7 @@ class Primitives<
                   }
 
                   size_t ccd_nnz = *(volatile unsigned*)&ccd_inds[ccd_total_tiles];
-                  size_t ccd_payload = ccd_align_up(ccd_nnz * sizeof(T), sizeof(unsigned)) + ccd_nnz * sizeof(unsigned);
+                  size_t ccd_payload = ccd_align_up(ccd_nnz * (size_t)ccdEltSize, sizeof(unsigned)) + ccd_nnz * sizeof(unsigned);
 
                   if (tid == 0) {
                     CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -494,7 +496,7 @@ class Primitives<
                   }
 
                   if (slice == 0) {
-                    float actual_density = (float)ccd_nnz / (float)workSize;
+                    float actual_density = (float)ccd_nnz / (float)realWorkSize;
                     if (!Recv) {
                       ccdBaseDensity = actual_density;
                       ccdTrackedDensity = actual_density;
@@ -514,20 +516,19 @@ class Primitives<
 
                   uint64_t* ccd_bv   = (uint64_t*)ccd_send_after_hdr;
                   unsigned* ccd_inds = (unsigned*)(ccd_send_after_hdr + ccd_bv_padded);
-                  T* ccd_vals        = (T*)(ccd_send_after_hdr + ccd_vals_offset);
 
-                  if (workSize % ccd_M != 0) {
-                    ccd_fused_single_block_spop_compress<T, unsigned, true>(
-                        ccd_dense_buf, ccd_vals,
+                  if (realWorkSize % (int)ccd_M != 0) {
+                    ccd_compress_dispatch<T, unsigned, true>(
+                        (int)ccdEltSize, ccd_dense_buf, (void*)(ccd_send_after_hdr + ccd_vals_offset),
                         ccd_N, ccd_M,
                         ccd_bv, ccd_inds,
                         0, nworkers / warpSize - 1,
                         ccd_bar, nworkers,
                         CcdCompressionProtocol::SPOP,
-                        (size_t)workSize);
+                        (size_t)realWorkSize);
                   } else {
-                    ccd_fused_single_block_spop_compress<T, unsigned, false>(
-                        ccd_dense_buf, ccd_vals,
+                    ccd_compress_dispatch<T, unsigned, false>(
+                        (int)ccdEltSize, ccd_dense_buf, (void*)(ccd_send_after_hdr + ccd_vals_offset),
                         ccd_N, ccd_M,
                         ccd_bv, ccd_inds,
                         0, nworkers / warpSize - 1,
@@ -535,7 +536,7 @@ class Primitives<
                   }
 
                   size_t ccd_nnz = ccd_inds[ccd_total_tiles];
-                  size_t ccd_payload = ccd_vals_offset + ccd_nnz * sizeof(T);
+                  size_t ccd_payload = ccd_vals_offset + ccd_nnz * (size_t)ccdEltSize;
 
                   if (tid == 0) {
                     CcdSparseChunkHeader* hdr = (CcdSparseChunkHeader*)(ccd_send_after_hdr - sizeof(CcdSparseChunkHeader));
@@ -554,7 +555,7 @@ class Primitives<
                   }
 
                   if (slice == 0) {
-                    float actual_density = (float)ccd_nnz / (float)workSize;
+                    float actual_density = (float)ccd_nnz / (float)realWorkSize;
                     if (!Recv) {
                       ccdBaseDensity = actual_density;
                       ccdTrackedDensity = actual_density;
@@ -620,11 +621,10 @@ class Primitives<
                 }
                 int ccd_bar_z = 15 - group - (nworkers != nthreads ? 1 : 0);
                 barrier_sync(ccd_bar_z, nworkers);
-                const T* recv_vals = (const T*)ccd_recv_after_hdr;
-                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * sizeof(T), sizeof(unsigned)));
-                ccd_coo1d_decompress_into<T, unsigned>(
-                    ccd_out, recv_vals, recv_keys, ccd_recv_hdr->nnz,
-                    0, nworkers / warpSize - 1);
+                const unsigned* recv_keys = (const unsigned*)(ccd_recv_after_hdr + ccd_align_up(ccd_recv_hdr->nnz * (size_t)ccdEltSize, sizeof(unsigned)));
+                ccd_coo1d_decompress_dispatch<T>(
+                    (int)ccdEltSize, ccd_out, ccd_recv_after_hdr, recv_keys,
+                    ccd_recv_hdr->nnz, (size_t)realWorkSize, 0, nworkers / warpSize - 1);
               } else {
                 // SPOP
                 for (int i = tid; i < workSize; i += nworkers) {
@@ -634,10 +634,9 @@ class Primitives<
                 barrier_sync(ccd_bar_z, nworkers);
                 const uint64_t* recv_bv  = (const uint64_t*)(ccd_recv_after_hdr + ccd_recv_hdr->bv_offset);
                 const unsigned* recv_inds = (const unsigned*)(ccd_recv_after_hdr + ccd_recv_hdr->inds_offset);
-                const T* recv_vals        = (const T*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset);
-                ccd_decompress_or_scatter_into<T, unsigned>(
-                    ccd_out, recv_vals, ccd_N, ccd_M,
-                    recv_bv, recv_inds, 0, nworkers / warpSize - 1,
+                ccd_spop_dispatch<T>(
+                    (int)ccdEltSize, ccd_out, (const void*)(ccd_recv_after_hdr + ccd_recv_hdr->vals_offset),
+                    ccd_N, ccd_M, recv_bv, recv_inds, 0, nworkers / warpSize - 1,
                     /*scatter_into=*/false);
               }
 
@@ -1050,6 +1049,7 @@ private:
     index = -1;
     isSparse = collWork ? collWork->isSparse : 0;
     ccdFormatMask = collWork ? collWork->ccdFormatMask : CcdMaskAll;
+    ccdEltSize = collWork ? collWork->ccdEltSize : (uint8_t)sizeof(T);
     ccdDenseThreshold = collWork ? collWork->ccdDenseThreshold : 0.3f;
     ccdAgDenseThreshold = collWork ? collWork->ccdAgDenseThreshold : 0.1f;
     ccdDenseIntraThreshold = collWork ? collWork->ccdDenseIntraThreshold : 0.9f;

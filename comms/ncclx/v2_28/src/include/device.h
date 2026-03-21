@@ -307,6 +307,7 @@ struct alignas(16) ncclDevWorkColl {
   // Sparse communication support
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  uint8_t ccdEltSize;  // Original element size (e.g. 4 for float) before AllGather int8 conversion
   float ccdDenseThreshold;
   float ccdAgDenseThreshold;
   float ccdDenseIntraThreshold;

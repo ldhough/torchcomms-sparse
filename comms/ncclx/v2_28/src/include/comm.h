@@ -257,6 +257,7 @@ struct ncclTaskColl {
   // Sparse communication support
   uint8_t isSparse;
   uint8_t ccdFormatMask;
+  uint8_t ccdEltSize;  // Original element size before AllGather int8 conversion
   float ccdDenseThreshold;
   float ccdAgDenseThreshold;
   float ccdDenseIntraThreshold;
