@@ -325,6 +325,7 @@ class Primitives<
           // decompress/scatter-add from local memory instead of scattered
           // NVLink reads.  NET recv and P2P write recv are already local.
           bool shouldStage = recv_is_compressed
+              && (ccd_recv_fmt != CcdCompressionProtocol::COO1D)
               && (ncclShmem.groups[group].recvConns[0]->flags & NCCL_P2P_READ);
 
           if (Src) {
