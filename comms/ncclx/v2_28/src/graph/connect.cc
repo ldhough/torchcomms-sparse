@@ -493,7 +493,17 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
     nChannels = comm->nChannels = copyChannels(comm, nChannels, std::max(ncclMinNchannels(), comm->config.minCTAs), ringPrev, ringNext);
   }
 
+  // Save natural topo channel count for dense collective tuning, then expand for CCD if needed.
   comm->collChannels = comm->nChannels;
+  {
+    const char* ccdChEnv = getenv("NCCL_CCD_CHANNELS");
+    if (ccdChEnv) {
+      int ccdCh = std::min(atoi(ccdChEnv), MAXCHANNELS);
+      if (ccdCh > (int)comm->nChannels) {
+        nChannels = comm->nChannels = copyChannels(comm, nChannels, ccdCh, ringPrev, ringNext);
+      }
+    }
+  }
 #if CUDART_VERSION >= 12010
   // Support maximal channel usage for aggregation
   if (shared && comm->nvlsChannels > parent->nvlsResources->nChannels) {

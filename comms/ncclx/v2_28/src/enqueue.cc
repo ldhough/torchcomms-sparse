@@ -1920,7 +1920,9 @@ static ncclResult_t topoGetAlgoInfo(
   if (simInfo) simInfo->estimatedTime = time;
   TRACE(NCCL_COLL, "%ld Bytes -> Algo %d proto %d time %f", nBytes, info->algorithm, info->protocol, time);
 
-  int nc = comm->nChannels;
+  // Dense collectives start from the natural topo channel count (collChannels),
+  // so CCD channel expansion doesn't inflate dense channel usage.
+  int nc = info->isSparse ? comm->nChannels : comm->collChannels;
   int nt = comm->maxThreads[info->algorithm][info->protocol];
   int threadThreshold = comm->threadThresholds[info->algorithm][info->protocol];
   if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT) {
@@ -2038,6 +2040,26 @@ static ncclResult_t getAlgoInfo(
   }
 
   info->nMaxChannels = nMaxChannels == 0 ? info->nMaxChannels : nMaxChannels;
+
+  // Sparse channel count override — takes final precedence
+  if (info->isSparse) {
+    const char* spCh = getenv("NCCL_CCD_CHANNELS");
+    if (spCh) {
+      int spNc = atoi(spCh);
+      if (spNc > 0) info->nMaxChannels = std::min(spNc, (int)comm->nChannels);
+    }
+  }
+
+  static const char* ccdDebug = getenv("NCCL_CCD_DEBUG");
+  if (ccdDebug && comm->rank == 0) {
+    fprintf(stderr, "CCD: %s %ld B -> algo %s proto %s %d ch%s\n",
+            ncclFuncToString(info->func), nBytes,
+            ncclAlgoToString(info->algorithm),
+            ncclProtoToString(info->protocol),
+            info->nMaxChannels,
+            info->isSparse ? " [sparse]" : "");
+  }
+
   return ncclSuccess;
 }
 
