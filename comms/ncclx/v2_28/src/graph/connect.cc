@@ -380,6 +380,14 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   int nranks = comm->nRanks;
   int nNodes = comm->nNodes;
   int nChannels = comm->nChannels;
+
+  // Single-rank communicator: no peers, no channels needed.
+  if (nranks <= 1) {
+    comm->nChannels = 1;
+    comm->collChannels = 1;
+    return ncclSuccess;
+  }
+
   int minHeadNum = INT_MAX;
   int shared = parent && parent->nvlsSupport  && parent->shareResources;
   NCCLCHECK(ncclCalloc(&ringRecv, nNodes*MAXCHANNELS));
@@ -451,7 +459,9 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   }
 
   // Duplication should be complete now
+  if (comm->rank == 0) fprintf(stderr, "CCD CHAN: pre-double nCh=%d nRanks=%d nNodes=%d\n", nChannels, nranks, nNodes);
   nChannels = comm->nChannels = std::min(MAXCHANNELS,nChannels*2);
+  if (comm->rank == 0) fprintf(stderr, "CCD CHAN: post-double nCh=%d\n", nChannels);
 
   // Setup CollNet
   if (comm->config.collnetEnable) {
@@ -494,10 +504,11 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   }
 
   // Save natural topo channel count for dense collective tuning, then expand for CCD if needed.
+  if (comm->rank == 0) fprintf(stderr, "CCD CHAN: after MIN/MAX nCh=%d\n", (int)comm->nChannels);
   comm->collChannels = comm->nChannels;
   {
     const char* ccdChEnv = getenv("NCCL_CCD_CHANNELS");
-    if (ccdChEnv) {
+    if (ccdChEnv && comm->nRanks > 1) {
       int ccdCh = std::min(atoi(ccdChEnv), MAXCHANNELS);
       if (ccdCh > (int)comm->nChannels) {
         nChannels = comm->nChannels = copyChannels(comm, nChannels, ccdCh, ringPrev, ringNext);
