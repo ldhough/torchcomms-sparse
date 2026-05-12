@@ -1,3 +1,10 @@
+# SpCCL
+
+SpCCL (**Sp**arse **C**ollective **C**ommunication **L**ibrary) is a collective communication library, forked from NCCLX, that supports sparse all-reduce, reduce-scatter, and all-gather. More details and paper preprint coming soon...
+
+# ORIGINAL README:
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="logo-dark.png">
